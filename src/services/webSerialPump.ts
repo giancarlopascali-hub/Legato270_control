@@ -1,9 +1,12 @@
 /**
  * Web Serial API Controller & Virtual Simulator for KD Scientific Legato 270
- * Runs directly inside modern browsers (Chrome, Edge, Opera) with ZERO software installation.
+ * Single-view laboratory controller running directly inside the browser.
  */
 
+import { ProgramStep } from '../types';
+
 export type PumpStatusPrompt = ':' | '>' | '<' | '*' | 'T*' | '!' | 'O' | '?' | 'DISCONNECTED';
+export type StatusCategory = 'Idle' | 'Running' | 'Error';
 
 export interface PumpTelemetry {
   isConnected: boolean;
@@ -12,21 +15,33 @@ export interface PumpTelemetry {
   baudRate: number;
   prompt: PumpStatusPrompt;
   statusText: string;
+  statusCategory: StatusCategory; // 'Idle' | 'Running' | 'Error'
   direction: 'infuse' | 'withdraw' | 'idle' | 'paused';
   flowRate: number;
   flowUnit: string;
   targetVolume: number | null;
   targetUnit: string;
+  strokeTarget: number | null;
+  infuseTarget: number | null;
+  withdrawTarget: number | null;
   infusedVolume: number;
   withdrawnVolume: number;
   diameterMm: number;
   carriagePercent: number; // 0 to 100%
+  motorForce: number; // 20% - 100%
   // Continuous cycling state
   continuousActive: boolean;
   currentCycle: number;
   totalCycles: number; // 0 = infinite
   cyclePhase: 'infusing_A' | 'withdrawing_A' | 'settling' | 'idle';
   elapsedRunTimeSec: number;
+  // Serial command monitoring
+  lastCommand: string;
+  lastResponse: string;
+  // Program Execution State
+  isProgramRunning: boolean;
+  currentProgramStep: number;
+  totalProgramSteps: number;
 }
 
 export interface SerialLogItem {
@@ -48,8 +63,8 @@ export class Legato270WebController {
   private isReading = false;
   private pollTimer: any = null;
   private simTimer: any = null;
-  private cycleTimer: any = null;
   private runClockTimer: any = null;
+  private programAbortController: AbortController | null = null;
 
   private telemetryListeners: TelemetryListener[] = [];
   private logListeners: LogListener[] = [];
@@ -60,24 +75,32 @@ export class Legato270WebController {
     portName: 'Virtual Legato 270 (Simulator)',
     baudRate: 115200,
     prompt: ':',
-    statusText: 'STOPPED',
+    statusText: 'STOPPED (Idle)',
+    statusCategory: 'Idle',
     direction: 'idle',
     flowRate: 2.5,
     flowUnit: 'ml/min',
     targetVolume: 5.0,
     targetUnit: 'ml',
+    strokeTarget: 5.0,
+    infuseTarget: 5.0,
+    withdrawTarget: 5.0,
     infusedVolume: 0.0,
     withdrawnVolume: 0.0,
     diameterMm: 14.50,
-    carriagePercent: 45,
+    carriagePercent: 40,
+    motorForce: 100,
     continuousActive: false,
     currentCycle: 0,
     totalCycles: 0,
     cyclePhase: 'idle',
     elapsedRunTimeSec: 0,
+    lastCommand: 'poll',
+    lastResponse: '00::',
+    isProgramRunning: false,
+    currentProgramStep: 0,
+    totalProgramSteps: 0,
   };
-
-  private valveDelaySec = 0.3;
 
   constructor() {
     this.startSimulationEngine();
@@ -85,21 +108,21 @@ export class Legato270WebController {
 
   public subscribeTelemetry(listener: TelemetryListener) {
     this.telemetryListeners.push(listener);
-    listener(this.state);
+    listener({ ...this.state });
     return () => {
-      this.telemetryListeners = this.telemetryListeners.filter(l => l !== listener);
+      this.telemetryListeners = this.telemetryListeners.filter((l) => l !== listener);
     };
   }
 
   public subscribeLog(listener: LogListener) {
     this.logListeners.push(listener);
     return () => {
-      this.logListeners = this.logListeners.filter(l => l !== listener);
+      this.logListeners = this.logListeners.filter((l) => l !== listener);
     };
   }
 
   private emitTelemetry() {
-    this.telemetryListeners.forEach(l => l({ ...this.state }));
+    this.telemetryListeners.forEach((l) => l({ ...this.state }));
   }
 
   private emitLog(type: 'tx' | 'rx' | 'info' | 'error' | 'cycle', text: string) {
@@ -109,12 +132,9 @@ export class Legato270WebController {
       type,
       text,
     };
-    this.logListeners.forEach(l => l(item));
+    this.logListeners.forEach((l) => l(item));
   }
 
-  /**
-   * Check if Web Serial API is supported in current browser
-   */
   public static isWebSerialSupported(): boolean {
     return typeof navigator !== 'undefined' && 'serial' in navigator;
   }
@@ -124,7 +144,9 @@ export class Legato270WebController {
    */
   public async connectUSB(baudRate: number = 115200): Promise<boolean> {
     if (!Legato270WebController.isWebSerialSupported()) {
-      this.emitLog('error', 'Web Serial API is not supported in this browser. Please use Chrome, Edge, or Opera.');
+      this.emitLog('error', 'Web Serial API is not supported in this browser. Please use Chrome or Edge.');
+      this.state.statusCategory = 'Error';
+      this.emitTelemetry();
       return false;
     }
 
@@ -139,48 +161,57 @@ export class Legato270WebController {
       this.state.isConnected = true;
       this.state.isRealHardware = true;
       this.state.baudRate = baudRate;
-      this.state.portName = 'Connected (USB Serial VCP)';
-      this.emitTelemetry();
-      this.emitLog('info', `Connected to physical USB port @ ${baudRate} bps.`);
+      this.state.portName = 'Connected Hardware (USB)';
+      this.state.statusCategory = 'Idle';
+      this.emitLog('info', `Serial Port Connected @ ${baudRate} 8-N-1.`);
 
       this.startReading();
 
       // Interrogate and query all actual hardware settings and live state from the pump
-      this.emitLog('info', 'Querying pump system status, rates, dimensions, and positions...');
+      this.emitLog('info', 'Querying pump system status, flow rates, dimensions, and positions...');
       await this.queryAllPumpParameters();
 
       this.startHardwarePolling();
       return true;
     } catch (err: any) {
-      this.emitLog('error', `Connection failed: ${err.message || err}`);
+      if (err.name !== 'NotFoundError') {
+        this.emitLog('error', `Connection error: ${err.message}`);
+        this.state.statusCategory = 'Error';
+      }
       return false;
     }
   }
 
   public async disconnectUSB() {
     this.stopHardwarePolling();
-    this.stopContinuousCycle();
+    this.isReading = false;
 
-    try {
-      if (this.reader) {
+    if (this.reader) {
+      try {
         await this.reader.cancel();
-        this.reader.releaseLock();
-        this.reader = null;
+      } catch {
+        // ignore
       }
-      if (this.port) {
-        await this.port.close();
-        this.port = null;
-      }
-    } catch (e) {
-      console.error(e);
     }
 
-    this.state.isConnected = true;
+    if (this.port) {
+      try {
+        await this.port.close();
+      } catch {
+        // ignore
+      }
+      this.port = null;
+    }
+
     this.state.isRealHardware = false;
     this.state.portName = 'Virtual Legato 270 (Simulator)';
-    this.emitTelemetry();
-    this.emitLog('info', 'Disconnected from USB port. Switched to browser simulation engine.');
+    this.state.statusCategory = 'Idle';
+    this.state.prompt = ':';
+    this.state.direction = 'idle';
+    this.state.statusText = 'STOPPED (Idle)';
+    this.emitLog('info', 'Switched back to virtual pump simulator.');
     this.startSimulationEngine();
+    this.emitTelemetry();
   }
 
   private async startReading() {
@@ -188,53 +219,52 @@ export class Legato270WebController {
     this.isReading = true;
 
     try {
-      while (this.port.readable && this.isReading) {
+      while (this.port && this.port.readable && this.isReading) {
         const textDecoder = new TextDecoderStream();
         this.readableStreamClosed = this.port.readable.pipeTo(textDecoder.writable);
         this.reader = textDecoder.readable.getReader();
 
         let buffer = '';
+
         while (true) {
           const { value, done } = await this.reader.read();
           if (done) break;
           if (value) {
             buffer += value;
-            if (buffer.includes('\n') || buffer.includes('\r') || this.containsPrompt(buffer)) {
-              const lines = buffer.split(/[\r\n]+/);
-              buffer = lines.pop() || '';
-              for (const line of lines) {
-                const trimmed = line.trim();
-                if (trimmed) {
-                  this.handleIncomingLine(trimmed);
-                }
+            const lines = buffer.split(/[\r\n]+/);
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed.length > 0) {
+                this.handleIncomingLine(trimmed);
               }
             }
           }
         }
       }
-    } catch (err) {
-      // Stream error or cancelled
+    } catch (err: any) {
+      if (this.isReading) {
+        this.emitLog('error', `Serial Read Error: ${err.message}`);
+        this.state.statusCategory = 'Error';
+        this.emitTelemetry();
+      }
     }
   }
 
-  private containsPrompt(text: string): boolean {
-    const prompts = [':', '>', '<', '*', 'T*', '!', 'O', '?'];
-    return prompts.some(p => text.trim().endsWith(p));
-  }
-
   public async queryAllPumpParameters(): Promise<void> {
-    // Send standard query commands sequence with small pauses
-    const queryList = ['echo off', 'ver', 'diameter', 'irate', 'tvolume', 'ivolume', 'wvolume', 'poll'];
+    const queryList = ['echo off', 'ver', 'diameter', 'irate', 'wrate', 'tvolume', 'ivolume', 'wvolume', 'force', 'poll'];
     for (const cmd of queryList) {
-      await this.sendCommand(cmd, true);
-      await new Promise(r => setTimeout(r, 60));
+      await this.sendCommand(cmd, false);
+      await new Promise((r) => setTimeout(r, 60));
     }
   }
 
   private handleIncomingLine(line: string) {
+    this.state.lastResponse = line;
     this.emitLog('rx', line);
 
-    // Extract prompt from line (e.g., 00:, 00>, 00<, 00*, 00T*, 00!)
+    // Extract prompt from line (e.g. 00:, 00>, 00<, 00*, 00T*, 00!)
     const promptMatch = line.match(/(T\*|[:><*!O?])$/);
     if (promptMatch) {
       const p = promptMatch[1] as PumpStatusPrompt;
@@ -264,15 +294,15 @@ export class Legato270WebController {
       const match = line.match(/([\d.]+)\s*(ml|ul|nl)\b/i);
       if (match) {
         const val = parseFloat(match[1]);
-        // If not already detected as infused or withdrawn
         if (!line.toLowerCase().includes('ivol') && !line.toLowerCase().includes('wvol')) {
           this.state.targetVolume = val;
+          this.state.strokeTarget = val;
           this.state.targetUnit = match[2].toLowerCase();
         }
       }
     }
 
-    // Parse infused volume (ivolume query response e.g. "00:1.2450 ml" or "1.2450 ml")
+    // Parse infused volume
     if (line.toLowerCase().includes('ivol') || (this.state.direction === 'infuse' && line.match(/[\d.]+\s*(ml|ul|nl)/i))) {
       const match = line.match(/([\d.]+)\s*(ml|ul|nl)/i);
       if (match) {
@@ -280,11 +310,19 @@ export class Legato270WebController {
       }
     }
 
-    // Parse withdrawn volume (wvolume query response e.g. "00:0.8500 ml")
+    // Parse withdrawn volume
     if (line.toLowerCase().includes('wvol') || (this.state.direction === 'withdraw' && line.match(/[\d.]+\s*(ml|ul|nl)/i))) {
       const match = line.match(/([\d.]+)\s*(ml|ul|nl)/i);
       if (match) {
         this.state.withdrawnVolume = parseFloat(match[1]);
+      }
+    }
+
+    // Parse force
+    if (line.toLowerCase().includes('force') || line.match(/(\d+)\s*%/)) {
+      const match = line.match(/(\d+)\s*%/);
+      if (match) {
+        this.state.motorForce = parseInt(match[1], 10);
       }
     }
 
@@ -311,32 +349,41 @@ export class Legato270WebController {
     switch (prompt) {
       case ':':
         this.state.statusText = 'STOPPED';
+        this.state.statusCategory = 'Idle';
         this.state.direction = 'idle';
         break;
       case '>':
-        this.state.statusText = 'INFUSING (Forward)';
+        this.state.statusText = 'INFUSING';
+        this.state.statusCategory = 'Running';
         this.state.direction = 'infuse';
         break;
       case '<':
-        this.state.statusText = 'WITHDRAWING (Reverse)';
+        this.state.statusText = 'WITHDRAWING';
+        this.state.statusCategory = 'Running';
         this.state.direction = 'withdraw';
         break;
       case '*':
         this.state.statusText = 'PAUSED';
+        this.state.statusCategory = 'Idle';
         this.state.direction = 'paused';
         break;
       case 'T*':
         this.state.statusText = 'TARGET REACHED';
+        this.state.statusCategory = 'Idle';
         this.state.direction = 'idle';
         break;
       case '!':
         this.state.statusText = 'ALARM / MOTOR STALL';
+        this.state.statusCategory = 'Error';
         this.state.direction = 'idle';
         break;
       case 'O':
       case '?':
         this.state.statusText = 'OUT OF RANGE / ERROR';
+        this.state.statusCategory = 'Error';
         break;
+      default:
+        this.state.statusCategory = 'Idle';
     }
   }
 
@@ -347,6 +394,7 @@ export class Legato270WebController {
         await this.sendCommand('poll', false);
         if (this.state.direction !== 'idle') {
           await this.sendCommand('ivolume', false);
+          await this.sendCommand('wvolume', false);
         }
       }
     }, 600);
@@ -359,12 +407,11 @@ export class Legato270WebController {
     }
   }
 
-  /**
-   * Send ASCII command to the pump
-   */
   public async sendCommand(command: string, logTx: boolean = true): Promise<void> {
     const cleanCmd = command.trim();
     if (!cleanCmd) return;
+
+    this.state.lastCommand = cleanCmd;
 
     if (logTx) {
       this.emitLog('tx', cleanCmd);
@@ -379,6 +426,8 @@ export class Legato270WebController {
         writer.releaseLock();
       } catch (err: any) {
         this.emitLog('error', `Write error: ${err.message}`);
+        this.state.statusCategory = 'Error';
+        this.emitTelemetry();
       }
       return;
     }
@@ -387,9 +436,6 @@ export class Legato270WebController {
     this.simulateCommand(cleanCmd);
   }
 
-  /**
-   * Internal Simulator for instant zero-install browser testing
-   */
   private simulateCommand(cmd: string) {
     const lower = cmd.toLowerCase();
     let rx = '';
@@ -397,31 +443,26 @@ export class Legato270WebController {
     if (lower === 'irun' || lower === 'run') {
       this.state.direction = 'infuse';
       this.state.prompt = '>';
-      this.state.statusText = 'INFUSING (Forward)';
+      this.state.statusText = 'INFUSING';
+      this.state.statusCategory = 'Running';
       rx = '00:>';
       this.startRunClock();
     } else if (lower === 'wrun') {
       this.state.direction = 'withdraw';
       this.state.prompt = '<';
-      this.state.statusText = 'WITHDRAWING (Reverse)';
+      this.state.statusText = 'WITHDRAWING';
+      this.state.statusCategory = 'Running';
       rx = '00:<';
       this.startRunClock();
     } else if (lower === 'stop' || lower === 'stp') {
       this.state.direction = 'idle';
       this.state.prompt = ':';
       this.state.statusText = 'STOPPED';
+      this.state.statusCategory = 'Idle';
+      this.state.continuousActive = false;
+      this.state.isProgramRunning = false;
       rx = '00::';
       this.stopRunClock();
-    } else if (lower === 'pause') {
-      this.state.direction = 'paused';
-      this.state.prompt = '*';
-      this.state.statusText = 'PAUSED';
-      rx = '00:*';
-    } else if (lower === 'restart') {
-      this.state.direction = this.state.direction === 'paused' ? 'infuse' : this.state.direction;
-      this.state.prompt = '>';
-      this.state.statusText = 'INFUSING (Forward)';
-      rx = '00:>';
     } else if (lower.startsWith('irate')) {
       const parts = lower.split(/\s+/);
       if (parts.length >= 3) {
@@ -446,10 +487,24 @@ export class Legato270WebController {
       const parts = lower.split(/\s+/);
       if (parts.length >= 2) {
         this.state.targetVolume = parseFloat(parts[1]) || null;
+        this.state.strokeTarget = this.state.targetVolume;
       }
       rx = `00:${this.state.targetVolume || 0} ${this.state.targetUnit}\n00:${this.state.prompt}`;
+    } else if (lower.startsWith('force')) {
+      const parts = lower.split(/\s+/);
+      if (parts.length >= 2) {
+        this.state.motorForce = parseInt(parts[1], 10) || 100;
+      }
+      rx = `00:${this.state.motorForce}%\n00:${this.state.prompt}`;
+    } else if (lower.startsWith('baud')) {
+      const parts = lower.split(/\s+/);
+      if (parts.length >= 2) {
+        this.state.baudRate = parseInt(parts[1], 10) || 115200;
+      }
+      rx = `00:${this.state.baudRate}\n00:${this.state.prompt}`;
     } else if (lower === 'ctvolume') {
       this.state.targetVolume = null;
+      this.state.strokeTarget = null;
       rx = '00::';
     } else if (lower === 'cvolume' || lower === 'civolume' || lower === 'cwvolume') {
       this.state.infusedVolume = 0;
@@ -471,12 +526,14 @@ export class Legato270WebController {
     } else {
       rx = '00:?\n00:O';
       this.state.prompt = 'O';
+      this.state.statusCategory = 'Error';
     }
 
     setTimeout(() => {
+      this.state.lastResponse = rx;
       this.emitLog('rx', rx);
       this.emitTelemetry();
-    }, 40);
+    }, 30);
   }
 
   private startSimulationEngine() {
@@ -493,12 +550,13 @@ export class Legato270WebController {
 
       if (this.state.direction === 'infuse') {
         this.state.infusedVolume += dVol;
-        this.state.carriagePercent = Math.min(95, this.state.carriagePercent + 0.35);
+        this.state.carriagePercent = Math.min(95, this.state.carriagePercent + 0.4);
 
         if (this.state.targetVolume && this.state.infusedVolume >= this.state.targetVolume) {
           this.state.direction = 'idle';
           this.state.prompt = 'T*';
           this.state.statusText = 'TARGET REACHED';
+          this.state.statusCategory = 'Idle';
           this.emitLog('rx', `00:Target reached (${this.state.targetVolume} ml)\n00:T*`);
           this.emitTelemetry();
 
@@ -508,12 +566,13 @@ export class Legato270WebController {
         }
       } else if (this.state.direction === 'withdraw') {
         this.state.withdrawnVolume += dVol;
-        this.state.carriagePercent = Math.max(5, this.state.carriagePercent - 0.35);
+        this.state.carriagePercent = Math.max(5, this.state.carriagePercent - 0.4);
 
         if (this.state.targetVolume && this.state.withdrawnVolume >= this.state.targetVolume) {
           this.state.direction = 'idle';
           this.state.prompt = 'T*';
           this.state.statusText = 'TARGET REACHED';
+          this.state.statusCategory = 'Idle';
           this.emitLog('rx', `00:Target reached (${this.state.targetVolume} ml)\n00:T*`);
           this.emitTelemetry();
 
@@ -552,30 +611,85 @@ export class Legato270WebController {
     }
   }
 
+  public resetRunClock() {
+    this.state.elapsedRunTimeSec = 0;
+    this.emitTelemetry();
+  }
+
   // -------------------------------------------------------------------------
-  // In-Browser Continuous Push-Pull Automation Routine
+  // High-Level Motion Commands
   // -------------------------------------------------------------------------
 
-  /**
-   * Start 24/7 or fixed-cycle continuous push-pull sequence
-   */
+  public async infuse() {
+    await this.sendCommand('irun');
+  }
+
+  public async withdraw() {
+    await this.sendCommand('wrun');
+  }
+
+  public async stop() {
+    this.state.continuousActive = false;
+    this.state.isProgramRunning = false;
+    if (this.programAbortController) {
+      this.programAbortController.abort();
+      this.programAbortController = null;
+    }
+    await this.sendCommand('stop');
+  }
+
+  public async setParameters(params: {
+    diameterMm?: number;
+    flowRate?: number;
+    flowUnit?: string;
+    targetVolume?: number | null;
+    strokeTarget?: number | null;
+    motorForce?: number;
+    baudRate?: number;
+  }) {
+    if (params.diameterMm !== undefined) {
+      await this.sendCommand(`diameter ${params.diameterMm}`);
+    }
+    if (params.flowRate !== undefined && params.flowUnit !== undefined) {
+      await this.sendCommand(`irate ${params.flowRate} ${params.flowUnit}`);
+      await this.sendCommand(`wrate ${params.flowRate} ${params.flowUnit}`);
+    }
+    if (params.targetVolume !== undefined) {
+      if (params.targetVolume === null || params.targetVolume <= 0) {
+        await this.sendCommand('ctvolume');
+      } else {
+        await this.sendCommand(`tvolume ${params.targetVolume} ${this.state.targetUnit}`);
+      }
+    }
+    if (params.motorForce !== undefined) {
+      await this.sendCommand(`force ${params.motorForce}`);
+    }
+    if (params.baudRate !== undefined) {
+      await this.sendCommand(`baud ${params.baudRate}`);
+    }
+    await this.sendCommand('poll', false);
+  }
+
+  // -------------------------------------------------------------------------
+  // Continuous Push-Pull Automation
+  // -------------------------------------------------------------------------
+
   public async startContinuousCycle(
     flowRate: number,
     flowUnit: string,
     strokeVolume: number,
-    totalCycles: number = 0,
-    valveDelaySec: number = 0.3
+    totalCycles: number = 0
   ) {
-    this.valveDelaySec = valveDelaySec;
     this.state.continuousActive = true;
     this.state.currentCycle = 1;
     this.state.totalCycles = totalCycles;
     this.state.flowRate = flowRate;
     this.state.flowUnit = flowUnit;
     this.state.targetVolume = strokeVolume;
+    this.state.strokeTarget = strokeVolume;
     this.state.cyclePhase = 'infusing_A';
 
-    this.emitLog('cycle', `[+] STARTING CONTINUOUS PUSH/PULL (Rate: ${flowRate} ${flowUnit}, Stroke: ${strokeVolume} ml, Target Cycles: ${totalCycles === 0 ? 'Infinite' : totalCycles})`);
+    this.emitLog('cycle', `[+] STARTING CONTINUOUS PUSH/PULL (Rate: ${flowRate} ${flowUnit}, Stroke: ${strokeVolume} ml, Cycles: ${totalCycles === 0 ? 'Infinite (24/7)' : totalCycles})`);
 
     await this.sendCommand('stop');
     await this.sendCommand(`irate ${flowRate} ${flowUnit}`);
@@ -587,60 +701,112 @@ export class Legato270WebController {
     this.state.withdrawnVolume = 0;
     this.emitTelemetry();
 
-    // Start Phase 1 (Forward Infuse A / Refill B)
-    this.emitLog('cycle', `Cycle #1 - Phase 1: Forward Stroke (Infuse A & Refill B)`);
+    this.emitLog('cycle', `Cycle #1 - Phase 1: Forward Stroke (Infuse A / Refill B)`);
     await this.sendCommand('irun');
-  }
-
-  public async stopContinuousCycle() {
-    this.state.continuousActive = false;
-    this.state.cyclePhase = 'idle';
-    await this.sendCommand('stop');
-    this.emitLog('cycle', `[-] Continuous Push/Pull stopped by user.`);
-    this.emitTelemetry();
   }
 
   private async handleContinuousTargetReached() {
     if (!this.state.continuousActive) return;
 
     if (this.state.cyclePhase === 'infusing_A') {
-      this.state.cyclePhase = 'settling';
-      this.emitLog('cycle', `Phase 1 stroke complete. Settling check-valves for ${this.valveDelaySec}s...`);
-      this.emitTelemetry();
-
-      setTimeout(async () => {
-        if (!this.state.continuousActive) return;
-        this.state.cyclePhase = 'withdrawing_A';
-        this.state.withdrawnVolume = 0;
-        this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 2: Reverse Stroke (Infuse B & Refill A)`);
-        await this.sendCommand('cvolume');
-        await this.sendCommand('wrun');
-      }, this.valveDelaySec * 1000);
-
+      this.state.cyclePhase = 'withdrawing_A';
+      this.state.withdrawnVolume = 0;
+      this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 2: Reverse Stroke (Infuse B / Refill A)`);
+      await this.sendCommand('cvolume');
+      await this.sendCommand('wrun');
     } else if (this.state.cyclePhase === 'withdrawing_A') {
       this.emitLog('cycle', `Completed Cycle #${this.state.currentCycle} bidirectional push/pull delivery.`);
 
       if (this.state.totalCycles > 0 && this.state.currentCycle >= this.state.totalCycles) {
-        this.emitLog('cycle', `[+] Successfully reached target ${this.state.totalCycles} cycles! Halting pump.`);
-        this.stopContinuousCycle();
+        this.emitLog('cycle', `[+] Completed target ${this.state.totalCycles} continuous cycles. Halting.`);
+        this.stop();
         return;
       }
 
-      this.state.cyclePhase = 'settling';
       this.state.currentCycle += 1;
+      this.state.cyclePhase = 'infusing_A';
+      this.state.infusedVolume = 0;
       this.emitTelemetry();
-
-      setTimeout(async () => {
-        if (!this.state.continuousActive) return;
-        this.state.cyclePhase = 'infusing_A';
-        this.state.infusedVolume = 0;
-        this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 1: Forward Stroke (Infuse A & Refill B)`);
-        await this.sendCommand('cvolume');
-        await this.sendCommand('irun');
-      }, this.valveDelaySec * 1000);
+      this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 1: Forward Stroke (Infuse A / Refill B)`);
+      await this.sendCommand('cvolume');
+      await this.sendCommand('irun');
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Custom Multi-Step Program Engine
+  // -------------------------------------------------------------------------
+
+  public async runCustomProgram(steps: ProgramStep[]) {
+    if (steps.length === 0) return;
+
+    this.state.isProgramRunning = true;
+    this.state.totalProgramSteps = steps.length;
+    this.programAbortController = new AbortController();
+    const signal = this.programAbortController.signal;
+
+    this.emitLog('info', `[+] Starting custom pump program with ${steps.length} steps.`);
+
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        if (signal.aborted || !this.state.isProgramRunning) break;
+
+        const step = steps[i];
+        this.state.currentProgramStep = i + 1;
+        this.emitTelemetry();
+
+        this.emitLog('info', `Program Step ${i + 1}/${steps.length}: ${step.type.toUpperCase()}`);
+
+        if (step.type === 'infuse') {
+          await this.sendCommand(`irate ${step.rate} ${step.rateUnit}`);
+          await this.sendCommand(`tvolume ${step.volume} ${step.volumeUnit}`);
+          await this.sendCommand('cvolume');
+          await this.sendCommand('irun');
+          await this.waitForTargetOrSignal(signal);
+        } else if (step.type === 'withdraw') {
+          await this.sendCommand(`wrate ${step.rate} ${step.rateUnit}`);
+          await this.sendCommand(`tvolume ${step.volume} ${step.volumeUnit}`);
+          await this.sendCommand('cvolume');
+          await this.sendCommand('wrun');
+          await this.waitForTargetOrSignal(signal);
+        } else if (step.type === 'pause') {
+          await this.sendCommand('stop');
+          const delaySec = step.durationSec || 5;
+          this.emitLog('info', `Pausing program for ${delaySec} seconds...`);
+          await new Promise((resolve) => setTimeout(resolve, delaySec * 1000));
+        } else if (step.type === 'ramp') {
+          // Ramp simulation / execution
+          await this.sendCommand(`irate ${step.rate} ${step.rateUnit}`);
+          await this.sendCommand(`tvolume ${step.volume} ${step.volumeUnit}`);
+          await this.sendCommand('irun');
+          await this.waitForTargetOrSignal(signal);
+        }
+      }
+
+      this.emitLog('info', `[+] Custom program execution completed.`);
+    } catch (err: any) {
+      this.emitLog('error', `Program execution halted: ${err.message}`);
+    } finally {
+      this.state.isProgramRunning = false;
+      this.state.currentProgramStep = 0;
+      this.emitTelemetry();
+    }
+  }
+
+  private waitForTargetOrSignal(signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const check = setInterval(() => {
+        if (signal.aborted) {
+          clearInterval(check);
+          reject(new Error('Aborted'));
+        } else if (this.state.prompt === 'T*' || this.state.direction === 'idle') {
+          clearInterval(check);
+          resolve();
+        }
+      }, 200);
+    });
   }
 }
 
-// Global Singleton Instance
+// Singleton Instance
 export const pumpController = new Legato270WebController();

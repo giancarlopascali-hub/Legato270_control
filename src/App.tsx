@@ -1,43 +1,36 @@
-import React, { useState } from 'react';
-import { Header, ActiveTab } from './components/Header';
-import { ConstantPumpMonitor } from './components/ConstantPumpMonitor';
-import { DirectPumpControl } from './components/DirectPumpControl';
-import { PythonScriptGenerator } from './components/PythonScriptGenerator';
-import { ProtocolReference } from './components/ProtocolReference';
-import { ContinuousGuide } from './components/ContinuousGuide';
-import { GitHubPagesGuide } from './components/GitHubPagesGuide';
+import React from 'react';
+import { Header } from './components/Header';
+import { TopSection } from './components/TopSection';
+import { BottomSection } from './components/BottomSection';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('direct');
-
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans selection:bg-blue-100 selection:text-blue-900">
+    <div className="min-h-screen bg-slate-100/70 text-slate-800 flex flex-col font-sans selection:bg-blue-100 selection:text-blue-900">
       
-      {/* Top Laboratory Navigation Bar */}
-      <Header activeTab={activeTab} setActiveTab={setActiveTab} />
+      {/* 1. Title Line with Connect USB, Status Flag (Idle/Running/Error), and Sync from pump */}
+      <Header />
 
-      {/* Persistent Real-Time Pump Status & Dual-Carriage Monitor Window */}
-      <ConstantPumpMonitor />
+      {/* 2. Main Single-Page Workspace (Top & Bottom Sections) */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 space-y-6">
+        
+        {/* Top Section: Command Buttons, Dynamic Syringe Visualizer, and Summary of System Parameters */}
+        <TopSection />
 
-      {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {activeTab === 'direct' && <DirectPumpControl />}
-        {activeTab === 'python' && <PythonScriptGenerator />}
-        {activeTab === 'protocol' && <ProtocolReference />}
-        {activeTab === 'continuous' && <ContinuousGuide />}
-        {activeTab === 'github' && <GitHubPagesGuide />}
+        {/* Bottom Section: Syringe Dimensions, Target Volumes, Advanced Setup & Custom Programs */}
+        <BottomSection />
+
       </main>
 
-      {/* Laboratory Footer */}
-      <footer className="border-t border-slate-200 bg-white py-4 text-xs text-slate-500">
-        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
+      {/* Minimal Footer */}
+      <footer className="border-t border-slate-200 bg-white py-3.5 text-xs text-slate-500">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <span className="font-semibold text-slate-700">KD Scientific Legato 270 Fluidics Suite</span>
+            <span className="font-bold text-slate-700">KD Scientific Legato 270 Controller</span>
             <span className="text-slate-300">&bull;</span>
-            <span className="text-slate-500">Harvard Bioscience Standard ASCII Protocol</span>
+            <span className="text-slate-500 font-mono text-[11px]">Harvard Bioscience Protocol</span>
           </div>
-          <div className="text-slate-500 text-[11px]">
-            Direct Browser USB Control (Web Serial API) &amp; Python driver generator. Zero software installation required.
+          <div className="text-slate-400 text-[11px]">
+            Direct Browser USB Control via Web Serial API (Zero-install deployment)
           </div>
         </div>
       </footer>
