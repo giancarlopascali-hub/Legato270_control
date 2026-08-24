@@ -56,10 +56,7 @@ export type LogListener = (log: SerialLogItem) => void;
 
 export class Legato270WebController {
   private port: any = null;
-  private reader: any = null;
-  private writer: any = null;
-  private readableStreamClosed: any = null;
-  private writableStreamClosed: any = null;
+  private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private isReading = false;
   private pollTimer: any = null;
   private simTimer: any = null;
@@ -192,6 +189,12 @@ export class Legato270WebController {
       } catch {
         // ignore
       }
+      try {
+        this.reader.releaseLock();
+      } catch {
+        // ignore
+      }
+      this.reader = null;
     }
 
     if (this.port) {
@@ -217,20 +220,19 @@ export class Legato270WebController {
   private async startReading() {
     if (!this.port || !this.port.readable) return;
     this.isReading = true;
+    const decoder = new TextDecoder();
+    let buffer = '';
 
-    try {
-      while (this.port && this.port.readable && this.isReading) {
-        const textDecoder = new TextDecoderStream();
-        this.readableStreamClosed = this.port.readable.pipeTo(textDecoder.writable);
-        this.reader = textDecoder.readable.getReader();
-
-        let buffer = '';
-
-        while (true) {
+    while (this.port && this.port.readable && this.isReading) {
+      try {
+        this.reader = this.port.readable.getReader();
+        while (this.isReading) {
           const { value, done } = await this.reader.read();
-          if (done) break;
+          if (done) {
+            break;
+          }
           if (value) {
-            buffer += value;
+            buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split(/[\r\n]+/);
             buffer = lines.pop() || '';
 
@@ -242,13 +244,26 @@ export class Legato270WebController {
             }
           }
         }
+      } catch (err: any) {
+        if (this.isReading) {
+          this.emitLog('error', `Serial Read Error: ${err.message}`);
+          this.state.statusCategory = 'Error';
+          this.emitTelemetry();
+        }
+      } finally {
+        if (this.reader) {
+          try {
+            this.reader.releaseLock();
+          } catch {
+            // ignore
+          }
+          this.reader = null;
+        }
       }
-    } catch (err: any) {
-      if (this.isReading) {
-        this.emitLog('error', `Serial Read Error: ${err.message}`);
-        this.state.statusCategory = 'Error';
-        this.emitTelemetry();
-      }
+
+      if (!this.isReading) break;
+      // Brief yield if reader completed or reset
+      await new Promise((r) => setTimeout(r, 100));
     }
   }
 
@@ -419,11 +434,14 @@ export class Legato270WebController {
 
     if (this.state.isRealHardware && this.port && this.port.writable) {
       try {
-        const textEncoder = new TextEncoderStream();
-        this.writableStreamClosed = textEncoder.readable.pipeTo(this.port.writable);
-        const writer = textEncoder.writable.getWriter();
-        await writer.write(cleanCmd + '\r');
-        writer.releaseLock();
+        const encoder = new TextEncoder();
+        const data = encoder.encode(cleanCmd + '\r');
+        const writer = this.port.writable.getWriter();
+        try {
+          await writer.write(data);
+        } finally {
+          writer.releaseLock();
+        }
       } catch (err: any) {
         this.emitLog('error', `Write error: ${err.message}`);
         this.state.statusCategory = 'Error';
