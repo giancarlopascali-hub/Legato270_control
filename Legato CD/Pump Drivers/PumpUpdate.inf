@@ -1,0 +1,108 @@
+;
+;	Harvard Apparatus Bulk Driver Install
+;
+;	Device installation file for USB 2.0 Bulk Interface
+;
+;	This file supports:
+;		Windows XP SP3 x86, SP2 x64
+;		Windows 7 x64 & x86
+;		Windows 8 x64 & x86
+;		Windows 10 x64 & x86
+;
+;	Copyright © 2016-2021 by Harvard Bioscience
+;
+[Version]
+Signature="$Windows NT$"
+DriverPackageType=PlugAndPlay
+DriverPackageDisplayName=%DESC%
+Provider=%MfgName%
+Class=USB
+ClassGUID={36FC9E60-C465-11CF-8056-444553540000}
+DriverVer=04/22/2021, 3.0.2.0
+CatalogFile=pumpupdate.cat
+
+[Manufacturer]
+%MfgName%=DeviceList, NT, NTamd64
+
+[SourceDisksNames]
+1=%USBBulk.DiskName%,,
+
+[SourceDisksFiles]
+USBBulk.sys = 1
+USBBulkx64.sys = 1
+
+[SourceDisksFiles.NT]
+USBBulk.sys = 1
+
+[SourceDisksFiles.NTamd64]
+USBBulkx64.sys = 1
+
+[DestinationDirs]
+USBBulkCopyFiles.NT = 12
+USBBulkCopyFiles.NTamd64 = 12
+
+[DeviceList.NT]
+%DESCRIPTION_0200%=USBBulkInstall.nt, USB\VID_1FE9&PID_0200&MI_00
+
+[DeviceList.NTamd64]
+%DESCRIPTION_0200%=USBBulkInstall.NTamd64, USB\VID_1FE9&PID_0200&MI_00
+
+[USBBulkInstall.NT]
+CopyFiles=USBBulkCopyFiles.NT
+AddReg=USBBulkEventLogAddReg.NT
+
+[USBBulkInstall.NTamd64]
+CopyFiles=USBBulkCopyFiles.NTamd64
+AddReg=USBBulkEventLogAddReg.NTamd64
+
+[USBBulkInstall.NT.Services]
+Addservice = USBBulk, 0x00000002, USBBulkAddService.NT
+
+[USBBulkInstall.NTamd64.Services]
+Addservice = USBBulk, 0x00000002, USBBulkAddService.NTamd64
+
+[USBBulkAddService.NT]
+DisplayName    = %USBBulk.SvcDesc%
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\USBBulk.sys
+
+[USBBulkAddService.NTamd64]
+DisplayName    = %USBBulk.SvcDesc%
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\USBBulkx64.sys
+
+[USBBulkEventLogAddReg.NT]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll;%%SystemRoot%%\System32\drivers\USBBulk.sys"
+HKR,,TypesSupported,  %REG_DWORD%,7
+
+[USBBulkEventLogAddReg.NTamd64]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll;%%SystemRoot%%\System32\drivers\USBBulkx64.sys"
+HKR,,TypesSupported,  %REG_DWORD%,7
+
+[USBBulkCopyFiles.NT]
+USBBulk.sys
+
+[USBBulkCopyFiles.NTamd64]
+USBBulkx64.sys
+
+;---------------------------------------------------------------;
+
+[Strings]
+MfgName = "Harvard Bioscience"
+DESCRIPTION_0200 = "HBIO Updater"
+USBBulk.SvcDesc = "Flash Update"
+USBBulk.DiskName = "Installation Disk"
+DESC="USB Bulk Driver Package"
+
+; Non-Localizable Strings, DO NOT MODIFY!
+REG_SZ         = 0x00000000
+REG_MULTI_SZ   = 0x00010000
+REG_EXPAND_SZ  = 0x00020000
+REG_BINARY     = 0x00000001
+REG_DWORD      = 0x00010001
+
+; *** EOF ***

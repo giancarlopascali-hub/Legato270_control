@@ -1,0 +1,9 @@
+<?xml version="1.0" ?>
+<dpinst>
+	<search>
+		<subDirectory>*</subDirectory>
+	</search>
+	<dpinstTitle>USB Device Driver Installer</dpinstTitle>
+	<welcomeTitle>Welcome to the USB Device Driver Installer</welcomeTitle>
+	<welcomeIntro>This wizard will install the drivers required to run devices from your PC</welcomeIntro>
+</dpinst>
