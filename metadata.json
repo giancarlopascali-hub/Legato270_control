@@ -1,0 +1,6 @@
+{
+  "name": "KD Scientific Legato 270 Controller & Python Tool",
+  "description": "Communication protocol reference, Python script generator, and interactive USB serial controller for the KD Scientific Legato 270 continuous push/pull syringe pump.",
+  "requestFramePermissions": ["serial"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
