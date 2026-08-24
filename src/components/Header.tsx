@@ -1,14 +1,25 @@
 import React, { useState, useEffect } from 'react';
-import { pumpController, PumpTelemetry } from '../services/webSerialPump';
-import { Usb, RefreshCw, Activity, CheckCircle, AlertCircle, AlertTriangle, Play, Square } from 'lucide-react';
+import { pumpController, PumpTelemetry, Legato270WebController } from '../services/webSerialPump';
+import { Usb, RefreshCw, AlertCircle, ExternalLink, Terminal } from 'lucide-react';
 
-export const Header: React.FC = () => {
+interface HeaderProps {
+  onToggleTerminal?: () => void;
+  showTerminal?: boolean;
+}
+
+export const Header: React.FC<HeaderProps> = ({ onToggleTerminal, showTerminal }) => {
   const [telemetry, setTelemetry] = useState<PumpTelemetry>(pumpController.state);
   const [isConnecting, setIsConnecting] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [selectedBaud, setSelectedBaud] = useState<number>(115200);
+  const [isIframe, setIsIframe] = useState<boolean>(false);
 
   useEffect(() => {
-    const unsub = pumpController.subscribeTelemetry((t) => setTelemetry(t));
+    setIsIframe(Legato270WebController.isInsideIframe());
+    const unsub = pumpController.subscribeTelemetry((t) => {
+      setTelemetry(t);
+      if (t.baudRate) setSelectedBaud(t.baudRate);
+    });
     return unsub;
   }, []);
 
@@ -17,7 +28,7 @@ export const Header: React.FC = () => {
       await pumpController.disconnectUSB();
     } else {
       setIsConnecting(true);
-      await pumpController.connectUSB(telemetry.baudRate || 115200);
+      await pumpController.connectUSB(selectedBaud);
       setIsConnecting(false);
     }
   };
@@ -26,6 +37,10 @@ export const Header: React.FC = () => {
     setIsSyncing(true);
     await pumpController.queryAllPumpParameters();
     setTimeout(() => setIsSyncing(false), 500);
+  };
+
+  const handleOpenNewTab = () => {
+    window.open(window.location.href, '_blank');
   };
 
   // Status flag: Idle / Running / Error
@@ -73,17 +88,49 @@ export const Header: React.FC = () => {
                 KD Scientific Legato 270 Controller
               </h1>
               <p className="text-[11px] text-slate-500 font-mono mt-0.5">
-                {telemetry.isRealHardware ? 'Hardware USB Connected (Web Serial)' : 'Virtual Laboratory Simulator Mode'}
+                {telemetry.isRealHardware
+                  ? `USB Hardware Connected (${telemetry.baudRate} Baud)`
+                  : 'Virtual Laboratory Simulator Mode'}
               </p>
             </div>
           </div>
         </div>
 
-        {/* Title Line Actions: Status Flag + Connect USB + Sync from pump */}
-        <div className="flex items-center gap-2.5 flex-wrap justify-end w-full sm:w-auto">
+        {/* Title Line Actions: Status Flag + Baud select + Connect USB + Sync from pump */}
+        <div className="flex items-center gap-2 flex-wrap justify-end w-full sm:w-auto">
           
+          {/* Iframe New Tab Shortcut */}
+          {isIframe && (
+            <button
+              id="header-open-tab-btn"
+              onClick={handleOpenNewTab}
+              className="flex items-center gap-1 px-2.5 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 font-semibold text-xs rounded-lg border border-amber-300 transition-colors shadow-2xs cursor-pointer"
+              title="Open in standalone browser tab to bypass iframe Web Serial restrictions"
+            >
+              <ExternalLink className="w-3.5 h-3.5 text-amber-700" />
+              <span>New Tab</span>
+            </button>
+          )}
+
           {/* Status Flag (Idle / Running / Error) */}
           {renderStatusFlag()}
+
+          {/* Terminal / Diagnostics Inspector Toggle */}
+          {onToggleTerminal && (
+            <button
+              id="toggle-terminal-btn"
+              onClick={onToggleTerminal}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors cursor-pointer ${
+                showTerminal
+                  ? 'bg-slate-800 text-white border-slate-900'
+                  : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+              }`}
+              title="Toggle Live Serial Communication Terminal & Inspector"
+            >
+              <Terminal className="w-3.5 h-3.5" />
+              <span>{showTerminal ? 'Hide Terminal' : 'Serial Terminal'}</span>
+            </button>
+          )}
 
           {/* Sync from pump Button */}
           <button
@@ -94,8 +141,24 @@ export const Header: React.FC = () => {
             title="Query current position, diameter, flow rates, and volume registers from pump"
           >
             <RefreshCw className={`w-3.5 h-3.5 text-slate-600 ${isSyncing ? 'animate-spin' : ''}`} />
-            <span>Sync from pump</span>
+            <span>Sync</span>
           </button>
+
+          {/* Baud Rate Selector (before connecting) */}
+          {!telemetry.isRealHardware && (
+            <select
+              value={selectedBaud}
+              onChange={(e) => setSelectedBaud(parseInt(e.target.value, 10))}
+              className="px-2 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              title="Target Baud Rate"
+            >
+              <option value={115200}>115200 Baud (Default)</option>
+              <option value={57600}>57600 Baud</option>
+              <option value={38400}>38400 Baud</option>
+              <option value={19200}>19200 Baud</option>
+              <option value={9600}>9600 Baud</option>
+            </select>
+          )}
 
           {/* Connect USB Button */}
           <button

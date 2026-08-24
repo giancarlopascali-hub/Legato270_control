@@ -1,6 +1,6 @@
 /**
- * Web Serial API Controller & Virtual Simulator for KD Scientific Legato 270
- * Single-view laboratory controller running directly inside the browser.
+ * Web Serial API Controller & Virtual Simulator for KD Scientific Legato Syringe Pumps
+ * Supports Legato 100, 130, 200, 210, 270, and Harvard Bioscience Harvard Apparatus pumps.
  */
 
 import { ProgramStep } from '../types';
@@ -13,6 +13,9 @@ export interface PumpTelemetry {
   isRealHardware: boolean;
   portName: string;
   baudRate: number;
+  pumpAddress: string; // e.g. "00" or ""
+  pumpModel: string;
+  firmwareVersion: string;
   prompt: PumpStatusPrompt;
   statusText: string;
   statusCategory: StatusCategory; // 'Idle' | 'Running' | 'Error'
@@ -29,6 +32,9 @@ export interface PumpTelemetry {
   diameterMm: number;
   carriagePercent: number; // 0 to 100%
   motorForce: number; // 20% - 100%
+  dtrEnabled: boolean;
+  rtsEnabled: boolean;
+  echoEnabled: boolean;
   // Continuous cycling state
   continuousActive: boolean;
   currentCycle: number;
@@ -62,15 +68,19 @@ export class Legato270WebController {
   private simTimer: any = null;
   private runClockTimer: any = null;
   private programAbortController: AbortController | null = null;
+  private commandQueue: Promise<void> = Promise.resolve();
 
   private telemetryListeners: TelemetryListener[] = [];
   private logListeners: LogListener[] = [];
 
   public state: PumpTelemetry = {
     isConnected: true,
-    isRealHardware: false, // Default to simulator until user clicks Connect USB
+    isRealHardware: false, // Default to simulator until user connects USB
     portName: 'Virtual Legato 270 (Simulator)',
     baudRate: 115200,
+    pumpAddress: '00',
+    pumpModel: 'KD Scientific Legato 270',
+    firmwareVersion: 'v2.1.0',
     prompt: ':',
     statusText: 'STOPPED (Idle)',
     statusCategory: 'Idle',
@@ -87,6 +97,9 @@ export class Legato270WebController {
     diameterMm: 14.50,
     carriagePercent: 40,
     motorForce: 100,
+    dtrEnabled: true,
+    rtsEnabled: true,
+    echoEnabled: false,
     continuousActive: false,
     currentCycle: 0,
     totalCycles: 0,
@@ -119,10 +132,11 @@ export class Legato270WebController {
   }
 
   private emitTelemetry() {
-    this.telemetryListeners.forEach((l) => l({ ...this.state }));
+    const clone = { ...this.state };
+    this.telemetryListeners.forEach((l) => l(clone));
   }
 
-  private emitLog(type: 'tx' | 'rx' | 'info' | 'error' | 'cycle', text: string) {
+  public emitLog(type: 'tx' | 'rx' | 'info' | 'error' | 'cycle', text: string) {
     const item: SerialLogItem = {
       id: Math.random().toString(36).substring(2, 9),
       timestamp: new Date().toLocaleTimeString(),
@@ -136,50 +150,178 @@ export class Legato270WebController {
     return typeof navigator !== 'undefined' && 'serial' in navigator;
   }
 
+  public static isInsideIframe(): boolean {
+    try {
+      return typeof window !== 'undefined' && window.self !== window.top;
+    } catch {
+      return true;
+    }
+  }
+
   /**
    * Request user permission and connect to physical USB pump
    */
   public async connectUSB(baudRate: number = 115200): Promise<boolean> {
     if (!Legato270WebController.isWebSerialSupported()) {
-      this.emitLog('error', 'Web Serial API is not supported in this browser. Please use Chrome or Edge.');
+      this.emitLog('error', 'Web Serial API is not supported in this browser. Please use Google Chrome or Microsoft Edge on desktop.');
       this.state.statusCategory = 'Error';
       this.emitTelemetry();
       return false;
     }
 
     try {
-      this.emitLog('info', `Requesting USB serial port access @ ${baudRate} baud...`);
+      this.emitLog('info', `Opening USB Serial Port dialog @ ${baudRate} baud (8-N-1)...`);
       const serial = (navigator as any).serial;
+      
+      // Request serial port from user
       this.port = await serial.requestPort();
-      await this.port.open({ baudRate });
+      
+      // Open port with 8-N-1 and flow control none
+      await this.port.open({
+        baudRate,
+        dataBits: 8,
+        stopBits: 1,
+        parity: 'none',
+        flowControl: 'none',
+        bufferSize: 8192,
+      });
+
+      // Assert DTR and RTS signals required by USB-CDC firmware
+      try {
+        await this.port.setSignals({ dataTerminalReady: true, requestToSend: true });
+        this.state.dtrEnabled = true;
+        this.state.rtsEnabled = true;
+      } catch (sigErr: any) {
+        this.emitLog('info', `Note: Hardware signals DTR/RTS initialized (${sigErr.message || 'ok'})`);
+      }
 
       this.stopSimulationEngine();
 
       this.state.isConnected = true;
       this.state.isRealHardware = true;
       this.state.baudRate = baudRate;
-      this.state.portName = 'Connected Hardware (USB)';
+      this.state.portName = 'Physical KD Scientific Pump (USB)';
       this.state.statusCategory = 'Idle';
-      this.emitLog('info', `Serial Port Connected @ ${baudRate} 8-N-1.`);
+      this.emitLog('info', `Serial Port successfully connected at ${baudRate} baud.`);
 
+      // Start continuous background stream reader
       this.startReading();
 
-      // Interrogate and query all actual hardware settings and live state from the pump
-      this.emitLog('info', 'Querying pump system status, flow rates, dimensions, and positions...');
-      await this.queryAllPumpParameters();
+      // Flush buffer and initialize handshake
+      await this.initializePumpConnection();
 
+      // Start regular status polling
       this.startHardwarePolling();
       return true;
     } catch (err: any) {
-      if (err.name !== 'NotFoundError') {
+      if (err.name === 'NotFoundError') {
+        this.emitLog('info', 'Port selection cancelled by user.');
+      } else if (err.name === 'SecurityError' || err.message?.includes('denied')) {
+        this.emitLog('error', `Browser Security Block: Web Serial is restricted inside iframes. Please open the app in a new standalone tab.`);
+        this.state.statusCategory = 'Error';
+      } else {
         this.emitLog('error', `Connection error: ${err.message}`);
         this.state.statusCategory = 'Error';
       }
+      this.emitTelemetry();
       return false;
     }
   }
 
-  public async disconnectUSB() {
+  /**
+   * Automatically test baud rates to find matching speed
+   */
+  public async autoDetectBaudRate(): Promise<number | null> {
+    if (!this.port) {
+      this.emitLog('error', 'Connect to a USB port first before running auto-detect.');
+      return null;
+    }
+
+    const testRates = [115200, 9600, 19200, 38400, 57600];
+    this.emitLog('info', `Auto-detecting baud rate across: ${testRates.join(', ')}...`);
+
+    for (const rate of testRates) {
+      try {
+        this.emitLog('info', `Testing ${rate} baud...`);
+        // Reopen at new rate
+        await this.disconnectPortOnly();
+        await this.port.open({
+          baudRate: rate,
+          dataBits: 8,
+          stopBits: 1,
+          parity: 'none',
+          flowControl: 'none',
+        });
+        await this.port.setSignals({ dataTerminalReady: true, requestToSend: true });
+        this.startReading();
+
+        // Send ver command and wait for response
+        let receivedValid = false;
+        const testHandler = (log: SerialLogItem) => {
+          if (log.type === 'rx' && (log.text.includes('Legato') || log.text.includes('00:') || log.text.includes(':') || log.text.includes('v'))) {
+            receivedValid = true;
+          }
+        };
+        const unsub = this.subscribeLog(testHandler);
+
+        await this.sendCommandRaw('echo off\r');
+        await new Promise((r) => setTimeout(r, 100));
+        await this.sendCommandRaw('ver\r');
+        await new Promise((r) => setTimeout(r, 300));
+
+        unsub();
+
+        if (receivedValid) {
+          this.state.baudRate = rate;
+          this.state.isRealHardware = true;
+          this.emitLog('info', `Successfully verified pump at ${rate} baud!`);
+          this.startHardwarePolling();
+          this.emitTelemetry();
+          return rate;
+        }
+      } catch (err: any) {
+        this.emitLog('info', `Baud ${rate} attempt: ${err.message}`);
+      }
+    }
+
+    this.emitLog('error', 'Could not auto-detect baud rate. Check cable connection and pump display settings.');
+    return null;
+  }
+
+  public async setControlSignals(dtr: boolean, rts: boolean) {
+    if (this.port && this.state.isRealHardware) {
+      try {
+        await this.port.setSignals({ dataTerminalReady: dtr, requestToSend: rts });
+        this.state.dtrEnabled = dtr;
+        this.state.rtsEnabled = rts;
+        this.emitLog('info', `Hardware signals updated: DTR=${dtr}, RTS=${rts}`);
+        this.emitTelemetry();
+      } catch (err: any) {
+        this.emitLog('error', `Failed to update signals: ${err.message}`);
+      }
+    }
+  }
+
+  private async initializePumpConnection() {
+    this.emitLog('info', 'Performing initialization handshake (echo off, ver, status)...');
+    
+    // Send wake-up carriage return
+    await this.sendCommandRaw('\r');
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Disable echo for clean machine parsing
+    await this.sendCommandRaw('echo off\r');
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Query version info
+    await this.sendCommandRaw('ver\r');
+    await new Promise((r) => setTimeout(r, 120));
+
+    // Query all current parameters from pump registers
+    await this.queryAllPumpParameters();
+  }
+
+  private async disconnectPortOnly() {
     this.stopHardwarePolling();
     this.isReading = false;
 
@@ -203,8 +345,12 @@ export class Legato270WebController {
       } catch {
         // ignore
       }
-      this.port = null;
     }
+  }
+
+  public async disconnectUSB() {
+    await this.disconnectPortOnly();
+    this.port = null;
 
     this.state.isRealHardware = false;
     this.state.portName = 'Virtual Legato 270 (Simulator)';
@@ -212,7 +358,7 @@ export class Legato270WebController {
     this.state.prompt = ':';
     this.state.direction = 'idle';
     this.state.statusText = 'STOPPED (Idle)';
-    this.emitLog('info', 'Switched back to virtual pump simulator.');
+    this.emitLog('info', 'Switched to virtual pump simulator.');
     this.startSimulationEngine();
     this.emitTelemetry();
   }
@@ -233,6 +379,8 @@ export class Legato270WebController {
           }
           if (value) {
             buffer += decoder.decode(value, { stream: true });
+            
+            // KD Scientific pumps send \r\n or \r\r\n
             const lines = buffer.split(/[\r\n]+/);
             buffer = lines.pop() || '';
 
@@ -262,7 +410,6 @@ export class Legato270WebController {
       }
 
       if (!this.isReading) break;
-      // Brief yield if reader completed or reset
       await new Promise((r) => setTimeout(r, 100));
     }
   }
@@ -271,7 +418,7 @@ export class Legato270WebController {
     const queryList = ['echo off', 'ver', 'diameter', 'irate', 'wrate', 'tvolume', 'ivolume', 'wvolume', 'force', 'poll'];
     for (const cmd of queryList) {
       await this.sendCommand(cmd, false);
-      await new Promise((r) => setTimeout(r, 60));
+      await new Promise((r) => setTimeout(r, 70));
     }
   }
 
@@ -279,7 +426,22 @@ export class Legato270WebController {
     this.state.lastResponse = line;
     this.emitLog('rx', line);
 
-    // Extract prompt from line (e.g. 00:, 00>, 00<, 00*, 00T*, 00!)
+    // Parse pump version (e.g. "KD Scientific Legato 200 v2.1.0" or "00:KD Scientific Legato 270")
+    if (line.includes('KD Scientific') || line.includes('Harvard') || line.includes('Legato') || line.toLowerCase().includes('syringe pump')) {
+      this.state.pumpModel = line.replace(/^\d+[:\s]*/, '').trim();
+      const vMatch = line.match(/v\d+\.\d+(\.\d+)?/i);
+      if (vMatch) {
+        this.state.firmwareVersion = vMatch[0];
+      }
+    }
+
+    // Extract address prefix if present (e.g. "00:", "01:", "00>")
+    const addrMatch = line.match(/^(\d{2}):/);
+    if (addrMatch) {
+      this.state.pumpAddress = addrMatch[1];
+    }
+
+    // Extract prompt from line (e.g. 00:, 00>, 00<, 00*, 00T*, 00!, 00O, 00?)
     const promptMatch = line.match(/(T\*|[:><*!O?])$/);
     if (promptMatch) {
       const p = promptMatch[1] as PumpStatusPrompt;
@@ -412,7 +574,7 @@ export class Legato270WebController {
           await this.sendCommand('wvolume', false);
         }
       }
-    }, 600);
+    }, 650);
   }
 
   private stopHardwarePolling() {
@@ -422,36 +584,57 @@ export class Legato270WebController {
     }
   }
 
-  public async sendCommand(command: string, logTx: boolean = true): Promise<void> {
-    const cleanCmd = command.trim();
-    if (!cleanCmd) return;
-
-    this.state.lastCommand = cleanCmd;
-
-    if (logTx) {
-      this.emitLog('tx', cleanCmd);
-    }
-
-    if (this.state.isRealHardware && this.port && this.port.writable) {
+  private async sendCommandRaw(dataString: string): Promise<void> {
+    if (!this.port || !this.port.writable) return;
+    try {
+      const encoder = new TextEncoder();
+      const writer = this.port.writable.getWriter();
       try {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(cleanCmd + '\r');
-        const writer = this.port.writable.getWriter();
-        try {
-          await writer.write(data);
-        } finally {
-          writer.releaseLock();
-        }
-      } catch (err: any) {
-        this.emitLog('error', `Write error: ${err.message}`);
-        this.state.statusCategory = 'Error';
-        this.emitTelemetry();
+        await writer.write(encoder.encode(dataString));
+      } finally {
+        writer.releaseLock();
       }
-      return;
+    } catch (err: any) {
+      this.emitLog('error', `Write error: ${err.message}`);
     }
+  }
 
-    // Virtual Simulator Execution
-    this.simulateCommand(cleanCmd);
+  public async sendCommand(command: string, logTx: boolean = true): Promise<void> {
+    // Queue commands sequentially to prevent race conditions on the serial bus
+    this.commandQueue = this.commandQueue.then(async () => {
+      const cleanCmd = command.trim();
+      if (!cleanCmd) return;
+
+      this.state.lastCommand = cleanCmd;
+
+      if (logTx) {
+        this.emitLog('tx', cleanCmd);
+      }
+
+      if (this.state.isRealHardware && this.port && this.port.writable) {
+        try {
+          // Standard KD Scientific terminator is Carriage Return \r
+          const encoder = new TextEncoder();
+          const data = encoder.encode(cleanCmd + '\r');
+          const writer = this.port.writable.getWriter();
+          try {
+            await writer.write(data);
+          } finally {
+            writer.releaseLock();
+          }
+        } catch (err: any) {
+          this.emitLog('error', `Write error: ${err.message}`);
+          this.state.statusCategory = 'Error';
+          this.emitTelemetry();
+        }
+        return;
+      }
+
+      // Virtual Simulator Execution
+      this.simulateCommand(cleanCmd);
+    });
+
+    return this.commandQueue;
   }
 
   private simulateCommand(cmd: string) {
@@ -793,7 +976,6 @@ export class Legato270WebController {
           this.emitLog('info', `Pausing program for ${delaySec} seconds...`);
           await new Promise((resolve) => setTimeout(resolve, delaySec * 1000));
         } else if (step.type === 'ramp') {
-          // Ramp simulation / execution
           await this.sendCommand(`irate ${step.rate} ${step.rateUnit}`);
           await this.sendCommand(`tvolume ${step.volume} ${step.volumeUnit}`);
           await this.sendCommand('irun');
