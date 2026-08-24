@@ -821,21 +821,67 @@ export class Legato270WebController {
   // High-Level Motion Commands
   // -------------------------------------------------------------------------
 
-  public async infuse() {
+  public async infuse(rate?: number, unit?: string, target?: number) {
+    if (rate !== undefined && unit !== undefined) {
+      this.state.flowRate = rate;
+      this.state.flowUnit = unit;
+      await this.sendCommand(`irate ${rate} ${unit}`);
+    }
+    if (target !== undefined) {
+      if (target > 0) {
+        this.state.targetVolume = target;
+        this.state.strokeTarget = target;
+        await this.sendCommand(`tvolume ${target} ml`);
+      } else {
+        await this.sendCommand('ctvolume');
+      }
+    }
+    this.state.direction = 'infuse';
+    this.state.prompt = '>';
+    this.state.statusText = 'INFUSING';
+    this.state.statusCategory = 'Running';
+    this.startRunClock();
+    this.emitTelemetry();
     await this.sendCommand('irun');
   }
 
-  public async withdraw() {
+  public async withdraw(rate?: number, unit?: string, target?: number) {
+    if (rate !== undefined && unit !== undefined) {
+      this.state.flowRate = rate;
+      this.state.flowUnit = unit;
+      await this.sendCommand(`wrate ${rate} ${unit}`);
+    }
+    if (target !== undefined) {
+      if (target > 0) {
+        this.state.targetVolume = target;
+        this.state.strokeTarget = target;
+        await this.sendCommand(`tvolume ${target} ml`);
+      } else {
+        await this.sendCommand('ctvolume');
+      }
+    }
+    this.state.direction = 'withdraw';
+    this.state.prompt = '<';
+    this.state.statusText = 'WITHDRAWING';
+    this.state.statusCategory = 'Running';
+    this.startRunClock();
+    this.emitTelemetry();
     await this.sendCommand('wrun');
   }
 
   public async stop() {
     this.state.continuousActive = false;
     this.state.isProgramRunning = false;
+    this.state.direction = 'idle';
+    this.state.prompt = ':';
+    this.state.statusText = 'STOPPED';
+    this.state.statusCategory = 'Idle';
+    this.stopRunClock();
     if (this.programAbortController) {
       this.programAbortController.abort();
       this.programAbortController = null;
     }
+    this.emitTelemetry();
     await this.sendCommand('stop');
   }
 
@@ -849,25 +895,33 @@ export class Legato270WebController {
     baudRate?: number;
   }) {
     if (params.diameterMm !== undefined) {
+      this.state.diameterMm = params.diameterMm;
       await this.sendCommand(`diameter ${params.diameterMm}`);
     }
     if (params.flowRate !== undefined && params.flowUnit !== undefined) {
+      this.state.flowRate = params.flowRate;
+      this.state.flowUnit = params.flowUnit;
       await this.sendCommand(`irate ${params.flowRate} ${params.flowUnit}`);
       await this.sendCommand(`wrate ${params.flowRate} ${params.flowUnit}`);
     }
     if (params.targetVolume !== undefined) {
+      this.state.targetVolume = params.targetVolume;
+      this.state.strokeTarget = params.strokeTarget ?? params.targetVolume;
       if (params.targetVolume === null || params.targetVolume <= 0) {
         await this.sendCommand('ctvolume');
       } else {
-        await this.sendCommand(`tvolume ${params.targetVolume} ${this.state.targetUnit}`);
+        await this.sendCommand(`tvolume ${params.targetVolume} ${this.state.targetUnit || 'ml'}`);
       }
     }
     if (params.motorForce !== undefined) {
+      this.state.motorForce = params.motorForce;
       await this.sendCommand(`force ${params.motorForce}`);
     }
     if (params.baudRate !== undefined) {
+      this.state.baudRate = params.baudRate;
       await this.sendCommand(`baud ${params.baudRate}`);
     }
+    this.emitTelemetry();
     await this.sendCommand('poll', false);
   }
 

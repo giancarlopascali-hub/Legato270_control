@@ -98,25 +98,32 @@ export const BottomSection: React.FC = () => {
   const [newStepDuration, setNewStepDuration] = useState<number>(5);
 
   useEffect(() => {
+    // Only update telemetry object for live monitoring; DO NOT overwrite local input fields on polling loops
     const unsub = pumpController.subscribeTelemetry((t) => {
       setTelemetry(t);
-      if (t.diameterMm && t.diameterMm > 0) {
-        setDiameterMm(t.diameterMm);
-      }
-      if (t.flowRate && t.flowRate > 0) {
-        setFlowRate(t.flowRate);
-      }
-      if (t.flowUnit) {
-        setFlowRateUnit(t.flowUnit);
-      }
-      if (t.targetVolume && t.targetVolume > 0) {
-        setStrokeTarget(t.targetVolume);
-        setInfuseTarget(t.targetVolume);
-        setWithdrawTarget(t.targetVolume);
-      }
     });
     return unsub;
   }, []);
+
+  // Explicitly pull parameters from pump into UI forms if requested
+  const handleReadFromPump = async () => {
+    await pumpController.queryAllPumpParameters();
+    const t = pumpController.state;
+    if (t.diameterMm && t.diameterMm > 0) {
+      setDiameterMm(t.diameterMm);
+    }
+    if (t.flowRate && t.flowRate > 0) {
+      setFlowRate(t.flowRate);
+    }
+    if (t.flowUnit) {
+      setFlowRateUnit(t.flowUnit);
+    }
+    if (t.targetVolume && t.targetVolume > 0) {
+      setStrokeTarget(t.targetVolume);
+      setInfuseTarget(t.targetVolume);
+      setWithdrawTarget(t.targetVolume);
+    }
+  };
 
   // Handle Preset Change
   const handlePresetSelect = (idx: number) => {
@@ -259,9 +266,18 @@ export const BottomSection: React.FC = () => {
         {/* ========================================================================= */}
         <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col justify-between">
           <div>
-            <div className="flex items-center gap-2 pb-3 mb-4 border-b border-slate-100">
-              <Sliders className="w-4 h-4 text-blue-600" />
-              <h2 className="text-sm font-bold text-slate-900">Syringe Dimensions</h2>
+            <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <Sliders className="w-4 h-4 text-blue-600" />
+                <h2 className="text-sm font-bold text-slate-900">Syringe Dimensions</h2>
+              </div>
+              <button
+                onClick={handleReadFromPump}
+                className="text-[11px] font-semibold text-blue-600 hover:text-blue-800 flex items-center gap-1 hover:underline cursor-pointer"
+                title="Read current syringe diameter register from pump"
+              >
+                <span>Sync from Pump</span>
+              </button>
             </div>
 
             <div className="space-y-4">
@@ -344,9 +360,18 @@ export const BottomSection: React.FC = () => {
         {/* ========================================================================= */}
         <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col justify-between">
           <div>
-            <div className="flex items-center gap-2 pb-3 mb-4 border-b border-slate-100">
-              <Gauge className="w-4 h-4 text-emerald-600" />
-              <h2 className="text-sm font-bold text-slate-900">Target Volumes &amp; Flow Rates</h2>
+            <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <Gauge className="w-4 h-4 text-emerald-600" />
+                <h2 className="text-sm font-bold text-slate-900">Target Volumes &amp; Flow Rates</h2>
+              </div>
+              <button
+                onClick={handleReadFromPump}
+                className="text-[11px] font-semibold text-emerald-600 hover:text-emerald-800 flex items-center gap-1 hover:underline cursor-pointer"
+                title="Read current flow rates and targets from pump"
+              >
+                <span>Sync from Pump</span>
+              </button>
             </div>
 
             <div className="space-y-3.5">
