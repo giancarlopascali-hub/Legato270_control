@@ -12,7 +12,8 @@ import {
   AlertTriangle,
   RefreshCw,
   Usb,
-  Power
+  Power,
+  ArrowDownCircle
 } from 'lucide-react';
 
 export const DiagnosticConsole: React.FC = () => {
@@ -24,8 +25,9 @@ export const DiagnosticConsole: React.FC = () => {
   const [autoDetecting, setAutoDetecting] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
   const [isIframe, setIsIframe] = useState<boolean>(false);
+  const [autoScroll, setAutoScroll] = useState<boolean>(true);
 
-  const terminalEndRef = useRef<HTMLDivElement>(null);
+  const terminalContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setIsIframe(Legato270WebController.isInsideIframe());
@@ -41,9 +43,26 @@ export const DiagnosticConsole: React.FC = () => {
     };
   }, []);
 
+  // Scroll ONLY the inner terminal container without affecting the browser page scroll
   useEffect(() => {
-    terminalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs]);
+    if (autoScroll && terminalContainerRef.current) {
+      terminalContainerRef.current.scrollTop = terminalContainerRef.current.scrollHeight;
+    }
+  }, [logs, autoScroll]);
+
+  const handleTerminalScroll = () => {
+    if (!terminalContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = terminalContainerRef.current;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 40;
+    setAutoScroll(isAtBottom);
+  };
+
+  const scrollToBottom = () => {
+    setAutoScroll(true);
+    if (terminalContainerRef.current) {
+      terminalContainerRef.current.scrollTop = terminalContainerRef.current.scrollHeight;
+    }
+  };
 
   const handleSendCommand = async (cmdToSend?: string) => {
     const cmd = cmdToSend || manualCmd;
@@ -53,6 +72,7 @@ export const DiagnosticConsole: React.FC = () => {
     setHistoryIndex(-1);
     if (!cmdToSend) setManualCmd('');
 
+    scrollToBottom();
     await pumpController.sendCommand(cmd);
   };
 
@@ -132,11 +152,25 @@ export const DiagnosticConsole: React.FC = () => {
               <h2 className="text-sm font-bold text-white tracking-wide">
                 Hardware Communication Terminal &amp; Protocol Inspector
               </h2>
-              <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
-                telemetry.isRealHardware ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-slate-800 text-slate-400 border border-slate-700'
-              }`}>
-                {telemetry.isRealHardware ? 'Direct USB Active' : 'Virtual Simulator'}
-              </span>
+              <button
+                id="terminal-toggle-usb-btn"
+                onClick={async () => {
+                  if (telemetry.isRealHardware) {
+                    await pumpController.disconnectUSB();
+                  } else {
+                    await pumpController.connectUSB(telemetry.baudRate || 115200);
+                  }
+                }}
+                className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  telemetry.isRealHardware
+                    ? 'bg-emerald-500/20 hover:bg-rose-500/20 text-emerald-300 hover:text-rose-300 border border-emerald-500/40 hover:border-rose-500/40'
+                    : 'bg-slate-800 hover:bg-blue-600/30 text-slate-400 hover:text-blue-300 border border-slate-700 hover:border-blue-500/40'
+                }`}
+                title={telemetry.isRealHardware ? 'Click to Disconnect physical USB' : 'Click to Connect physical USB'}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${telemetry.isRealHardware ? 'bg-emerald-400' : 'bg-slate-500'}`}></span>
+                <span>{telemetry.isRealHardware ? 'Direct USB Active (Disconnect)' : 'Virtual Simulator (Connect)'}</span>
+              </button>
             </div>
             <p className="text-xs text-slate-400 font-mono">
               Harvard Bioscience / KD Scientific ASCII Protocol (8-N-1, {telemetry.baudRate} Baud, Prompt: <span className="text-amber-400 font-bold">{telemetry.prompt}</span>)
@@ -146,6 +180,23 @@ export const DiagnosticConsole: React.FC = () => {
 
         {/* Action buttons */}
         <div className="flex items-center gap-2 flex-wrap">
+          <button
+            id="terminal-autoscroll-btn"
+            onClick={() => {
+              if (!autoScroll) scrollToBottom();
+              else setAutoScroll(false);
+            }}
+            className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors flex items-center gap-1.5 cursor-pointer ${
+              autoScroll
+                ? 'bg-blue-500/20 text-blue-300 border-blue-500/40 hover:bg-blue-500/30'
+                : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
+            }`}
+            title={autoScroll ? 'Auto-scroll is active. Click to pause.' : 'Auto-scroll is paused. Click to resume and snap to bottom.'}
+          >
+            <ArrowDownCircle className={`w-3.5 h-3.5 ${autoScroll ? 'text-blue-400' : 'text-slate-500'}`} />
+            <span>{autoScroll ? 'Auto-scroll: ON' : 'Scroll: PAUSED'}</span>
+          </button>
+
           <button
             id="terminal-copy-btn"
             onClick={handleCopyLogs}
@@ -254,58 +305,75 @@ export const DiagnosticConsole: React.FC = () => {
       </div>
 
       {/* Terminal Output Log Screen */}
-      <div className="h-64 sm:h-72 bg-black/90 border border-slate-800 rounded-xl p-3 font-mono text-xs overflow-y-auto space-y-1.5 shadow-inner">
-        {logs.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center text-slate-600 text-xs">
-            <Terminal className="w-8 h-8 mb-2 opacity-30" />
-            <p>Serial Terminal ready. Connect USB or send ASCII commands below.</p>
-          </div>
-        ) : (
-          logs.map((item) => (
-            <div key={item.id} className="leading-relaxed flex items-start gap-2">
-              <span className="text-slate-600 text-[10px] select-none shrink-0 font-mono">
-                {item.timestamp}
-              </span>
-
-              {item.type === 'tx' && (
-                <div className="text-cyan-400">
-                  <span className="text-cyan-600 font-bold select-none">&rarr; TX: </span>
-                  <span className="font-bold">{item.text}</span>
-                  <span className="text-slate-600 text-[10px]"> \r</span>
-                </div>
-              )}
-
-              {item.type === 'rx' && (
-                <div className="text-emerald-400">
-                  <span className="text-emerald-600 font-bold select-none">&larr; RX: </span>
-                  <span className="whitespace-pre-wrap">{item.text}</span>
-                </div>
-              )}
-
-              {item.type === 'info' && (
-                <div className="text-blue-300 italic">
-                  <span className="text-blue-500 select-none">[INFO] </span>
-                  <span>{item.text}</span>
-                </div>
-              )}
-
-              {item.type === 'error' && (
-                <div className="text-rose-400 font-semibold">
-                  <span className="text-rose-500 select-none">[ERROR] </span>
-                  <span>{item.text}</span>
-                </div>
-              )}
-
-              {item.type === 'cycle' && (
-                <div className="text-purple-300 font-bold">
-                  <span className="text-purple-500 select-none">[CYCLE] </span>
-                  <span>{item.text}</span>
-                </div>
-              )}
+      <div className="relative">
+        <div
+          id="terminal-output-container"
+          ref={terminalContainerRef}
+          onScroll={handleTerminalScroll}
+          className="h-64 sm:h-72 bg-black/90 border border-slate-800 rounded-xl p-3 font-mono text-xs overflow-y-auto space-y-1.5 shadow-inner"
+        >
+          {logs.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-slate-600 text-xs">
+              <Terminal className="w-8 h-8 mb-2 opacity-30" />
+              <p>Serial Terminal ready. Connect USB or send ASCII commands below.</p>
             </div>
-          ))
+          ) : (
+            logs.map((item) => (
+              <div key={item.id} className="leading-relaxed flex items-start gap-2">
+                <span className="text-slate-600 text-[10px] select-none shrink-0 font-mono">
+                  {item.timestamp}
+                </span>
+
+                {item.type === 'tx' && (
+                  <div className="text-cyan-400">
+                    <span className="text-cyan-600 font-bold select-none">&rarr; TX: </span>
+                    <span className="font-bold">{item.text}</span>
+                    <span className="text-slate-600 text-[10px]"> \r</span>
+                  </div>
+                )}
+
+                {item.type === 'rx' && (
+                  <div className="text-emerald-400">
+                    <span className="text-emerald-600 font-bold select-none">&larr; RX: </span>
+                    <span className="whitespace-pre-wrap">{item.text}</span>
+                  </div>
+                )}
+
+                {item.type === 'info' && (
+                  <div className="text-blue-300 italic">
+                    <span className="text-blue-500 select-none">[INFO] </span>
+                    <span>{item.text}</span>
+                  </div>
+                )}
+
+                {item.type === 'error' && (
+                  <div className="text-rose-400 font-semibold">
+                    <span className="text-rose-500 select-none">[ERROR] </span>
+                    <span>{item.text}</span>
+                  </div>
+                )}
+
+                {item.type === 'cycle' && (
+                  <div className="text-purple-300 font-bold">
+                    <span className="text-purple-500 select-none">[CYCLE] </span>
+                    <span>{item.text}</span>
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Floating pill when auto-scroll is paused and user scrolled up */}
+        {!autoScroll && logs.length > 0 && (
+          <button
+            onClick={scrollToBottom}
+            className="absolute bottom-3 right-4 px-3 py-1 bg-blue-600/90 hover:bg-blue-500 text-white text-xs rounded-full shadow-lg border border-blue-400/30 flex items-center gap-1.5 backdrop-blur transition-all active:scale-95 cursor-pointer"
+          >
+            <ArrowDownCircle className="w-3.5 h-3.5" />
+            <span>Scroll to latest</span>
+          </button>
         )}
-        <div ref={terminalEndRef} />
       </div>
 
       {/* Quick Command Toolbar */}

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { pumpController, PumpTelemetry, Legato270WebController } from '../services/webSerialPump';
-import { Usb, RefreshCw, AlertCircle, ExternalLink, Terminal } from 'lucide-react';
+import { Usb, Unplug, RefreshCw, AlertCircle, ExternalLink, Terminal } from 'lucide-react';
 
 interface HeaderProps {
   onToggleTerminal?: () => void;
@@ -160,23 +160,34 @@ export const Header: React.FC<HeaderProps> = ({ onToggleTerminal, showTerminal }
             </select>
           )}
 
-          {/* Connect USB Button */}
+          {/* Dynamic Connect / Disconnect USB Button */}
           <button
             id="connect-usb-btn"
             onClick={handleConnectToggle}
             disabled={isConnecting}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shadow-2xs cursor-pointer ${
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs cursor-pointer ${
               telemetry.isRealHardware
-                ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
-                : 'bg-blue-600 hover:bg-blue-700 text-white'
+                ? 'bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white'
+                : 'bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white'
             } disabled:opacity-50`}
+            title={
+              telemetry.isRealHardware
+                ? 'Click to disconnect USB serial connection from physical pump'
+                : 'Connect to physical KD Scientific Legato pump via USB Serial (Chrome/Edge)'
+            }
           >
-            <Usb className="w-3.5 h-3.5" />
+            {isConnecting ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : telemetry.isRealHardware ? (
+              <Unplug className="w-3.5 h-3.5" />
+            ) : (
+              <Usb className="w-3.5 h-3.5" />
+            )}
             <span>
               {isConnecting
                 ? 'Connecting...'
                 : telemetry.isRealHardware
-                ? 'USB Connected'
+                ? 'Disconnect USB'
                 : 'Connect USB'}
             </span>
           </button>
