@@ -43,8 +43,17 @@ export const Header: React.FC<HeaderProps> = ({ onToggleTerminal, showTerminal }
     window.open(window.location.href, '_blank');
   };
 
-  // Status flag: Idle / Running / Error
+  // Status flag: Idle / Running / Error / Stalled
   const renderStatusFlag = () => {
+    if (telemetry.statusText?.includes('STALL')) {
+      return (
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-50 border border-amber-300 text-amber-900 font-semibold text-xs shadow-xs animate-pulse">
+          <AlertCircle className="w-4 h-4 text-amber-600" />
+          <span>Status: {telemetry.statusText}</span>
+        </div>
+      );
+    }
+
     if (telemetry.statusCategory === 'Running') {
       return (
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-800 font-semibold text-xs animate-pulse">
@@ -57,7 +66,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleTerminal, showTerminal }
 
     if (telemetry.statusCategory === 'Error') {
       return (
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-rose-50 border border-rose-300 text-rose-800 font-semibold text-xs">
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-rose-50 border border-rose-300 text-rose-800 font-semibold text-xs shadow-xs">
           <AlertCircle className="w-4 h-4 text-rose-600" />
           <span>Status: Error ({telemetry.statusText || 'Alarm/Stall'})</span>
         </div>

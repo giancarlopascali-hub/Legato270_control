@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { pumpController, PumpTelemetry } from '../services/webSerialPump';
+import { pumpController, PumpTelemetry, formatDisplayUnit } from '../services/webSerialPump';
 import { SYRINGE_PRESETS } from '../data/legatoCommands';
 import { ProgramStep } from '../types';
 import {
@@ -123,6 +123,11 @@ export const BottomSection: React.FC = () => {
       setInfuseTarget(t.targetVolume);
       setWithdrawTarget(t.targetVolume);
     }
+    if (t.targetUnit) {
+      setStrokeTargetUnit(t.targetUnit as any);
+      setInfuseTargetUnit(t.targetUnit as any);
+      setWithdrawTargetUnit(t.targetUnit as any);
+    }
   };
 
   // Handle Preset Change
@@ -148,7 +153,10 @@ export const BottomSection: React.FC = () => {
       flowRate,
       flowUnit: flowRateUnit,
       targetVolume: strokeTarget || infuseTarget,
-      strokeTarget
+      targetUnit: strokeTargetUnit,
+      strokeTarget,
+      infuseTarget,
+      withdrawTarget
     });
     setTargetsSaved(true);
     setTimeout(() => setTargetsSaved(false), 2000);
@@ -452,7 +460,7 @@ export const BottomSection: React.FC = () => {
                       className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 pr-8"
                     />
                     <span className="absolute right-2 top-1.5 text-[10px] font-mono text-slate-500 pointer-events-none">
-                      ml
+                      {formatDisplayUnit(strokeTargetUnit)}
                     </span>
                   </div>
                 </div>
@@ -472,7 +480,7 @@ export const BottomSection: React.FC = () => {
                       className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 pr-8"
                     />
                     <span className="absolute right-2 top-1.5 text-[10px] font-mono text-slate-500 pointer-events-none">
-                      ml
+                      {formatDisplayUnit(strokeTargetUnit)}
                     </span>
                   </div>
                 </div>
@@ -841,10 +849,10 @@ export const BottomSection: React.FC = () => {
                         </span>
                       </td>
                       <td className="py-2.5 px-3 font-mono text-slate-900">
-                        {step.type === 'pause' ? '—' : `${step.volume} ${step.volumeUnit}`}
+                        {step.type === 'pause' ? '—' : `${step.volume} ${formatDisplayUnit(step.volumeUnit)}`}
                       </td>
                       <td className="py-2.5 px-3 font-mono text-slate-900">
-                        {step.type === 'pause' ? '—' : `${step.rate} ${step.rateUnit}`}
+                        {step.type === 'pause' ? '—' : `${step.rate} ${formatDisplayUnit(step.rateUnit)}`}
                       </td>
                       <td className="py-2.5 px-3 font-mono text-slate-600">
                         {step.type === 'pause' ? `${step.durationSec} seconds` : 'Auto (Until Target)'}
