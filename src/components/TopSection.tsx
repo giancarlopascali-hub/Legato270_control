@@ -1,6 +1,23 @@
 import React, { useState, useEffect } from 'react';
-import { pumpController, PumpTelemetry, formatDisplayUnit } from '../services/webSerialPump';
-import { Play, ArrowRight, ArrowLeft, RefreshCw, Square, Clock, Terminal, Activity, RotateCcw, AlertTriangle } from 'lucide-react';
+import {
+  pumpController,
+  PumpTelemetry,
+  formatDisplayUnit,
+  toMicroliters
+} from '../services/webSerialPump';
+import {
+  Play,
+  ArrowRight,
+  ArrowLeft,
+  RefreshCw,
+  Square,
+  Clock,
+  Terminal,
+  Activity,
+  RotateCcw,
+  AlertTriangle,
+  Timer
+} from 'lucide-react';
 
 export const TopSection: React.FC = () => {
   const [telemetry, setTelemetry] = useState<PumpTelemetry>(pumpController.state);
@@ -26,10 +43,13 @@ export const TopSection: React.FC = () => {
   };
 
   const handleContinuous = async () => {
-    const stroke = telemetry.strokeTarget || telemetry.targetVolume || 5.0;
-    const rate = telemetry.flowRate || 2.5;
-    const unit = telemetry.flowUnit || 'ml/min';
-    await pumpController.startContinuousCycle(rate, unit, stroke, 0);
+    const stroke = telemetry.targetVolume || telemetry.strokeTarget || 5.0;
+    const infRate = telemetry.infuseRate || telemetry.flowRate || 2.5;
+    const infUnit = telemetry.infuseRateUnit || telemetry.flowUnit || 'ml/min';
+    const wthRate = telemetry.withdrawRate || infRate;
+    const wthUnit = telemetry.withdrawRateUnit || infUnit;
+    const volUnit = telemetry.targetUnit || telemetry.volumeUnit || 'ml';
+    await pumpController.startContinuousCycle(infRate, infUnit, stroke, 0, wthRate, wthUnit, volUnit);
   };
 
   const handleStop = async () => {
@@ -40,52 +60,70 @@ export const TopSection: React.FC = () => {
     await pumpController.resetCounters();
   };
 
-  const activeTarget = (telemetry.targetVolume && telemetry.targetVolume > 0)
-    ? telemetry.targetVolume
-    : (telemetry.strokeTarget && telemetry.strokeTarget > 0 ? telemetry.strokeTarget : 10.0);
-
   const volUnit = formatDisplayUnit(telemetry.volumeUnit || telemetry.targetUnit || 'ml');
-  const flowUnit = formatDisplayUnit(telemetry.flowUnit || 'ml/min');
+  const infRateUnit = formatDisplayUnit(telemetry.infuseRateUnit || telemetry.flowUnit || 'ml/min');
+  const wthRateUnit = formatDisplayUnit(telemetry.withdrawRateUnit || telemetry.flowUnit || 'ml/min');
+
+  // Dynamic Syringe Graphic calculation normalized to microliters so µl, nl, and ml scale perfectly
+  const targetInUl = (telemetry.targetVolume && telemetry.targetVolume > 0)
+    ? toMicroliters(telemetry.targetVolume, telemetry.targetUnit || telemetry.volumeUnit || 'ml')
+    : toMicroliters(telemetry.strokeTarget && telemetry.strokeTarget > 0 ? telemetry.strokeTarget : 10.0, telemetry.targetUnit || 'ml');
+
+  const infInUl = toMicroliters(telemetry.infusedVolume, telemetry.volumeUnit || telemetry.targetUnit || 'ml');
+  const wthInUl = toMicroliters(telemetry.withdrawnVolume, telemetry.volumeUnit || telemetry.targetUnit || 'ml');
 
   // Dynamic fill calculation for Syringe A (Forward Infuse): starts full, drains as infusedVolume accumulates
-  const deliveredRatioA = activeTarget > 0 ? Math.min(1, Math.max(0, telemetry.infusedVolume / activeTarget)) : 0;
+  const deliveredRatioA = targetInUl > 0 ? Math.min(1, Math.max(0, infInUl / targetInUl)) : 0;
   const fluidPercentA = Math.max(0, Math.min(100, (1 - deliveredRatioA) * 100));
   const plungerPositionA = fluidPercentA;
 
   // Dynamic fill calculation for Syringe B (Reverse Infuse / Refill): refills as withdrawnVolume accumulates
-  const deliveredRatioB = activeTarget > 0 ? Math.min(1, Math.max(0, telemetry.withdrawnVolume / activeTarget)) : 0;
+  const deliveredRatioB = targetInUl > 0 ? Math.min(1, Math.max(0, wthInUl / targetInUl)) : 0;
   const fluidPercentB = Math.max(0, Math.min(100, deliveredRatioB * 100));
   const plungerPositionB = fluidPercentB;
 
-  const isStalled = telemetry.statusText.includes('STALL') || telemetry.statusCategory === 'Error';
+  const isStalled =
+    telemetry.isStalled ||
+    telemetry.statusText.includes('STALL') ||
+    telemetry.statusCategory === 'Error' ||
+    telemetry.prompt === '*' ||
+    telemetry.prompt === '!';
 
   return (
     <section id="top-section" className="space-y-4">
 
-      {/* Stall Warning Alert Banner */}
+      {/* Motor Stall Warning Alert Banner */}
       {isStalled && (
-        <div className="bg-amber-50 border-2 border-amber-400 rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-900 shadow-sm animate-pulse">
+        <div
+          id="motor-stall-alert-banner"
+          className="bg-amber-50 border-2 border-amber-400 rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-900 shadow-sm animate-pulse"
+        >
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-xs">
-              <AlertTriangle className="w-5 h-5 fill-current" />
+            <div className="w-10 h-10 rounded-lg bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-xs">
+              <AlertTriangle className="w-6 h-6 fill-current" />
             </div>
             <div>
               <h3 className="text-xs font-bold uppercase tracking-wider text-amber-900">
-                Pump Stall / Mechanical Limit Detected ({telemetry.statusText})
+                Pump Motor Stall / Hardware Alarm Detected
               </h3>
               <p className="text-xs text-amber-800 mt-0.5">
-                The pump motor has encountered resistance or reached the travel limit. Check physical syringe placement, clear blockages, and press <strong>Stop</strong> or <strong>Reset Counters</strong> to resume.
+                {telemetry.stallMessage ? (
+                  <>Hardware message: <strong className="font-mono bg-amber-100 px-1 py-0.5 rounded">{telemetry.stallMessage}</strong> &mdash; </>
+                ) : null}
+                The motor encountered physical resistance or reached end of travel. Check syringe alignment and press <strong>Clear &amp; Stop</strong> or <strong>Reset Counters</strong>.
               </p>
             </div>
           </div>
           <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
             <button
+              id="clear-stall-stop-btn"
               onClick={handleStop}
               className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg shadow-xs cursor-pointer transition-colors"
             >
               Clear &amp; Stop
             </button>
             <button
+              id="clear-stall-reset-btn"
               onClick={handleResetVolumeTimer}
               className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold rounded-lg shadow-xs cursor-pointer transition-colors"
             >
@@ -116,7 +154,7 @@ export const TopSection: React.FC = () => {
               }`}
             >
               <Play className="w-4 h-4 fill-current" />
-              <span>Infuse</span>
+              <span>Infuse ({telemetry.infuseRate || telemetry.flowRate} {infRateUnit})</span>
             </button>
 
             {/* Withdraw Button */}
@@ -130,7 +168,7 @@ export const TopSection: React.FC = () => {
               }`}
             >
               <ArrowLeft className="w-4 h-4" />
-              <span>Withdraw</span>
+              <span>Withdraw ({telemetry.withdrawRate || telemetry.flowRate} {wthRateUnit})</span>
             </button>
 
             {/* Continuous Button */}
@@ -144,7 +182,7 @@ export const TopSection: React.FC = () => {
               }`}
             >
               <RefreshCw className={`w-4 h-4 ${telemetry.continuousActive ? 'animate-spin' : ''}`} />
-              <span>{telemetry.continuousActive ? `Continuous (${telemetry.currentCycle})` : 'Continuous'}</span>
+              <span>{telemetry.continuousActive ? `Continuous (Cycle ${telemetry.currentCycle})` : 'Continuous (Push/Pull)'}</span>
             </button>
 
             {/* Stop Button */}
@@ -183,7 +221,7 @@ export const TopSection: React.FC = () => {
           <div className="flex items-center gap-2">
             <Activity className="w-4 h-4 text-blue-600" />
             <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800">
-              Dual-Syringe Mechanical Visualizer (Legato 270 Opposed Push/Pull)
+              Dual-Syringe Mechanical Visualizer (Opposed Push/Pull)
             </h2>
           </div>
           <div className="flex items-center gap-2 text-xs font-mono text-slate-500">
@@ -200,9 +238,9 @@ export const TopSection: React.FC = () => {
             <div className="flex items-center justify-between text-xs">
               <div className="flex items-center gap-2">
                 <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
-                <span className="font-semibold text-slate-900">Syringe A (Forward Infuse):</span>
+                <span className="font-semibold text-slate-900">Syringe A (Forward Channel):</span>
                 <span className="text-slate-500 text-[11px]">
-                  {telemetry.direction === 'infuse' ? 'Dispensing to Target' : 'Refilling / Idle'}
+                  {telemetry.direction === 'infuse' ? 'Dispensing / Infusing' : 'Refilling / Idle'}
                 </span>
               </div>
               <span className="font-mono font-bold text-slate-700 text-xs">
@@ -226,7 +264,7 @@ export const TopSection: React.FC = () => {
               />
               <div className="absolute inset-0 flex items-center justify-between px-3 text-[10px] font-mono text-slate-700 pointer-events-none">
                 <span>0 {volUnit} (Empty)</span>
-                <span>Barrel Capacity ({activeTarget} {volUnit})</span>
+                <span>Barrel Capacity ({telemetry.targetVolume || telemetry.strokeTarget || 5} {volUnit})</span>
               </div>
             </div>
           </div>
@@ -241,7 +279,7 @@ export const TopSection: React.FC = () => {
                 </span>
               ) : telemetry.direction === 'withdraw' ? (
                 <span className="inline-flex items-center gap-1 text-sky-700 font-bold font-mono">
-                  <ArrowLeft className="w-4 h-4 animate-bounce" /> Moving Left (&larr; Infuse B / Refill A)
+                  <ArrowLeft className="w-4 h-4 animate-bounce" /> Moving Left (&larr; Withdraw / Infuse B)
                 </span>
               ) : (
                 <span className="text-slate-500 font-mono">Stationary (Stopped)</span>
@@ -260,13 +298,13 @@ export const TopSection: React.FC = () => {
             <div className="flex items-center justify-between text-xs">
               <div className="flex items-center gap-2">
                 <span className="w-2.5 h-2.5 rounded-full bg-sky-500"></span>
-                <span className="font-semibold text-slate-900">Syringe B (Reverse Infuse):</span>
+                <span className="font-semibold text-slate-900">Syringe B (Reverse Channel):</span>
                 <span className="text-slate-500 text-[11px]">
-                  {telemetry.direction === 'withdraw' ? 'Dispensing to Target' : 'Refilling / Idle'}
+                  {telemetry.direction === 'withdraw' ? 'Dispensing / Withdrawing' : 'Refilling / Idle'}
                 </span>
               </div>
               <span className="font-mono font-bold text-slate-700 text-xs">
-                Withdrawn/Refilled: {telemetry.withdrawnVolume.toFixed(4)} {volUnit}
+                Withdrawn: {telemetry.withdrawnVolume.toFixed(4)} {volUnit}
               </span>
             </div>
 
@@ -286,7 +324,7 @@ export const TopSection: React.FC = () => {
               />
               <div className="absolute inset-0 flex items-center justify-between px-3 text-[10px] font-mono text-slate-700 pointer-events-none">
                 <span>0 {volUnit} (Empty)</span>
-                <span>Barrel Capacity ({activeTarget} {volUnit})</span>
+                <span>Barrel Capacity ({telemetry.targetVolume || telemetry.strokeTarget || 5} {volUnit})</span>
               </div>
             </div>
           </div>
@@ -305,39 +343,39 @@ export const TopSection: React.FC = () => {
 
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           
-          {/* Target Stroke */}
+          {/* Target Volume (tvolume) */}
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
             <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold block">
-              Target Stroke
+              Target Volume (tvolume)
             </span>
             <div className="text-base font-mono font-bold text-slate-900 mt-1 truncate">
-              {telemetry.strokeTarget ? `${telemetry.strokeTarget} ${formatDisplayUnit(telemetry.targetUnit || 'ml')}` : 'Continuous'}
+              {telemetry.targetVolume ? `${telemetry.targetVolume} ${formatDisplayUnit(telemetry.targetUnit || 'ml')}` : 'Continuous'}
             </div>
-            <span className="text-[10px] text-slate-500 block mt-0.5">Per-cycle limit</span>
-          </div>
-
-          {/* Serial Command & Prompt */}
-          <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
-            <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold block">
-              Serial Command
-            </span>
-            <div className="text-base font-mono font-bold text-blue-700 mt-1 truncate">
-              {telemetry.lastCommand || 'poll'}
-            </div>
-            <span className="text-[10px] text-slate-500 block mt-0.5 font-mono">
-              RX Prompt: {telemetry.prompt || ':'}
+            <span className="text-[10px] text-slate-500 block mt-0.5">
+              {telemetry.targetTimeEnabled && telemetry.targetTime ? `Timer: ${telemetry.targetTime}` : 'Per-stroke limit'}
             </span>
           </div>
 
-          {/* Flow Rate */}
+          {/* Infuse Rate */}
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
-            <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold block">
-              Flow Rate
+            <span className="text-[10px] uppercase tracking-wider text-emerald-700 font-bold block">
+              Infuse Rate (irate)
             </span>
-            <div className="text-base font-mono font-bold text-slate-900 mt-1 truncate">
-              {telemetry.flowRate} {flowUnit}
+            <div className="text-base font-mono font-bold text-emerald-700 mt-1 truncate">
+              {telemetry.infuseRate || telemetry.flowRate} {infRateUnit}
             </div>
-            <span className="text-[10px] text-slate-500 block mt-0.5">Active calibrated speed</span>
+            <span className="text-[10px] text-slate-500 block mt-0.5">irate register</span>
+          </div>
+
+          {/* Withdraw Rate */}
+          <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+            <span className="text-[10px] uppercase tracking-wider text-sky-700 font-bold block">
+              Withdraw Rate (wrate)
+            </span>
+            <div className="text-base font-mono font-bold text-sky-700 mt-1 truncate">
+              {telemetry.withdrawRate || telemetry.flowRate} {wthRateUnit}
+            </div>
+            <span className="text-[10px] text-slate-500 block mt-0.5">wrate register</span>
           </div>
 
           {/* Infused Volume */}
@@ -362,16 +400,18 @@ export const TopSection: React.FC = () => {
             <span className="text-[10px] text-slate-500 block mt-0.5">wvolume register</span>
           </div>
 
-          {/* Timer */}
+          {/* Elapsed Timer */}
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
             <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold block flex items-center gap-1">
               <Clock className="w-3 h-3 text-slate-400" />
-              <span>Timer</span>
+              <span>Elapsed Timer</span>
             </span>
             <div className="text-base font-mono font-bold text-slate-900 mt-1 truncate">
               {formatTimer(telemetry.elapsedRunTimeSec)}
             </div>
-            <span className="text-[10px] text-slate-500 block mt-0.5">Elapsed pumping time</span>
+            <span className="text-[10px] text-slate-500 block mt-0.5">
+              {telemetry.targetTimeEnabled && telemetry.targetTime ? `Target: ${telemetry.targetTime}` : 'Active run clock'}
+            </span>
           </div>
 
         </div>

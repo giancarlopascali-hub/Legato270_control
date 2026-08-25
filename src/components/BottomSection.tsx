@@ -32,18 +32,25 @@ export const BottomSection: React.FC = () => {
   const [diameterMm, setDiameterMm] = useState<number>(14.50);
   const [diameterSaved, setDiameterSaved] = useState<boolean>(false);
 
-  // 2. Target Volumes State
-  const [infuseTarget, setInfuseTarget] = useState<number>(5.0);
-  const [infuseTargetUnit, setInfuseTargetUnit] = useState<'ml' | 'ul' | 'nl'>('ml');
+  // 2. Flow Rates & Target Volume State
+  const [infuseRate, setInfuseRate] = useState<number>(2.5);
+  const [infuseRateUnit, setInfuseRateUnit] = useState<string>('ml/min');
 
-  const [withdrawTarget, setWithdrawTarget] = useState<number>(5.0);
-  const [withdrawTargetUnit, setWithdrawTargetUnit] = useState<'ml' | 'ul' | 'nl'>('ml');
+  const [withdrawRate, setWithdrawRate] = useState<number>(2.5);
+  const [withdrawRateUnit, setWithdrawRateUnit] = useState<string>('ml/min');
 
-  const [strokeTarget, setStrokeTarget] = useState<number>(5.0);
-  const [strokeTargetUnit, setStrokeTargetUnit] = useState<'ml' | 'ul' | 'nl'>('ml');
+  const [syncRates, setSyncRates] = useState<boolean>(true);
 
-  const [flowRate, setFlowRate] = useState<number>(2.5);
-  const [flowRateUnit, setFlowRateUnit] = useState<string>('ml/min');
+  // Single unified target volume (tvolume)
+  const [targetVolume, setTargetVolume] = useState<number>(5.0);
+  const [targetVolumeUnit, setTargetVolumeUnit] = useState<'ml' | 'ul' | 'nl'>('ml');
+
+  // Target Time for infuse/withdraw only
+  const [targetTimeEnabled, setTargetTimeEnabled] = useState<boolean>(false);
+  const [targetTimeHours, setTargetTimeHours] = useState<number>(0);
+  const [targetTimeMins, setTargetTimeMins] = useState<number>(5);
+  const [targetTimeSecs, setTargetTimeSecs] = useState<number>(0);
+
   const [targetsSaved, setTargetsSaved] = useState<boolean>(false);
 
   // 3. Advanced Setup State
@@ -105,6 +112,10 @@ export const BottomSection: React.FC = () => {
     return unsub;
   }, []);
 
+  const formatTimeStr = (h: number, m: number, s: number) => {
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
   // Explicitly pull parameters from pump into UI forms if requested
   const handleReadFromPump = async () => {
     await pumpController.queryAllPumpParameters();
@@ -112,21 +123,32 @@ export const BottomSection: React.FC = () => {
     if (t.diameterMm && t.diameterMm > 0) {
       setDiameterMm(t.diameterMm);
     }
-    if (t.flowRate && t.flowRate > 0) {
-      setFlowRate(t.flowRate);
+    if (t.infuseRate && t.infuseRate > 0) {
+      setInfuseRate(t.infuseRate);
     }
-    if (t.flowUnit) {
-      setFlowRateUnit(t.flowUnit);
+    if (t.infuseRateUnit) {
+      setInfuseRateUnit(t.infuseRateUnit);
+    }
+    if (t.withdrawRate && t.withdrawRate > 0) {
+      setWithdrawRate(t.withdrawRate);
+    }
+    if (t.withdrawRateUnit) {
+      setWithdrawRateUnit(t.withdrawRateUnit);
     }
     if (t.targetVolume && t.targetVolume > 0) {
-      setStrokeTarget(t.targetVolume);
-      setInfuseTarget(t.targetVolume);
-      setWithdrawTarget(t.targetVolume);
+      setTargetVolume(t.targetVolume);
     }
     if (t.targetUnit) {
-      setStrokeTargetUnit(t.targetUnit as any);
-      setInfuseTargetUnit(t.targetUnit as any);
-      setWithdrawTargetUnit(t.targetUnit as any);
+      setTargetVolumeUnit(t.targetUnit as any);
+    }
+    if (t.targetTime) {
+      const parts = t.targetTime.split(':').map(Number);
+      if (parts.length === 3) {
+        setTargetTimeHours(parts[0] || 0);
+        setTargetTimeMins(parts[1] || 0);
+        setTargetTimeSecs(parts[2] || 0);
+        setTargetTimeEnabled(true);
+      }
     }
   };
 
@@ -146,17 +168,20 @@ export const BottomSection: React.FC = () => {
     setTimeout(() => setDiameterSaved(false), 2000);
   };
 
-  // Apply Target Volumes & Flow Rate
+  // Apply Target Volume, Dual Flow Rates & Target Time
   const handleApplyTargets = async () => {
+    const timeStr = targetTimeEnabled ? formatTimeStr(targetTimeHours, targetTimeMins, targetTimeSecs) : null;
     await pumpController.setParameters({
       diameterMm,
-      flowRate,
-      flowUnit: flowRateUnit,
-      targetVolume: strokeTarget || infuseTarget,
-      targetUnit: strokeTargetUnit,
-      strokeTarget,
-      infuseTarget,
-      withdrawTarget
+      infuseRate,
+      infuseRateUnit,
+      withdrawRate,
+      withdrawRateUnit,
+      targetVolume,
+      targetUnit: targetVolumeUnit,
+      volumeUnit: targetVolumeUnit,
+      targetTime: timeStr,
+      targetTimeEnabled
     });
     setTargetsSaved(true);
     setTimeout(() => setTargetsSaved(false), 2000);
@@ -364,14 +389,14 @@ export const BottomSection: React.FC = () => {
         </div>
 
         {/* ========================================================================= */}
-        {/* 2. TARGET VOLUMES BOX */}
+        {/* 2. TARGET VOLUME & FLOW RATES BOX */}
         {/* ========================================================================= */}
         <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col justify-between">
           <div>
             <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
               <div className="flex items-center gap-2">
                 <Gauge className="w-4 h-4 text-emerald-600" />
-                <h2 className="text-sm font-bold text-slate-900">Target Volumes &amp; Flow Rates</h2>
+                <h2 className="text-sm font-bold text-slate-900">Target Volume &amp; Flow Rates</h2>
               </div>
               <button
                 onClick={handleReadFromPump}
@@ -384,25 +409,38 @@ export const BottomSection: React.FC = () => {
 
             <div className="space-y-3.5">
               
-              {/* Flow Rate */}
+              {/* Infuse Flow Rate (irate) */}
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Pumping Flow Rate:
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-semibold text-slate-700">
+                    Infuse Flow Rate (irate):
+                  </label>
+                  <span className="text-[11px] font-mono text-emerald-700 font-semibold">
+                    {telemetry.infuseRate || telemetry.flowRate} {formatDisplayUnit(telemetry.infuseRateUnit || telemetry.flowUnit || 'ml/min')}
+                  </span>
+                </div>
                 <div className="grid grid-cols-2 gap-2">
                   <input
-                    id="target-flow-rate-input"
+                    id="infuse-flow-rate-input"
                     type="number"
                     step="0.001"
                     min="0.0001"
-                    value={flowRate}
-                    onChange={(e) => setFlowRate(parseFloat(e.target.value) || 0)}
+                    value={infuseRate}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value) || 0;
+                      setInfuseRate(val);
+                      if (syncRates) setWithdrawRate(val);
+                    }}
                     className="px-3 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                   <select
-                    id="target-flow-unit-select"
-                    value={flowRateUnit}
-                    onChange={(e) => setFlowRateUnit(e.target.value)}
+                    id="infuse-flow-unit-select"
+                    value={infuseRateUnit}
+                    onChange={(e) => {
+                      const unit = e.target.value;
+                      setInfuseRateUnit(unit);
+                      if (syncRates) setWithdrawRateUnit(unit);
+                    }}
                     className="px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   >
                     <option value="ml/min">ml/min</option>
@@ -415,25 +453,92 @@ export const BottomSection: React.FC = () => {
                 </div>
               </div>
 
-              {/* Stroke Target (Primary Stroke Volume) */}
+              {/* Withdraw Flow Rate (wrate) */}
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Stroke Target (Per-Cycle Limit):
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-semibold text-slate-700">
+                    Withdraw Flow Rate (wrate):
+                  </label>
+                  <span className="text-[11px] font-mono text-sky-700 font-semibold">
+                    {telemetry.withdrawRate || telemetry.flowRate} {formatDisplayUnit(telemetry.withdrawRateUnit || telemetry.flowUnit || 'ml/min')}
+                  </span>
+                </div>
                 <div className="grid grid-cols-2 gap-2">
                   <input
-                    id="stroke-target-input"
+                    id="withdraw-flow-rate-input"
                     type="number"
-                    step="0.1"
-                    min="0"
-                    value={strokeTarget}
-                    onChange={(e) => setStrokeTarget(parseFloat(e.target.value) || 0)}
+                    step="0.001"
+                    min="0.0001"
+                    value={withdrawRate}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value) || 0;
+                      setWithdrawRate(val);
+                      if (syncRates) setInfuseRate(val);
+                    }}
                     className="px-3 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                   <select
-                    id="stroke-target-unit-select"
-                    value={strokeTargetUnit}
-                    onChange={(e) => setStrokeTargetUnit(e.target.value as any)}
+                    id="withdraw-flow-unit-select"
+                    value={withdrawRateUnit}
+                    onChange={(e) => {
+                      const unit = e.target.value;
+                      setWithdrawRateUnit(unit);
+                      if (syncRates) setInfuseRateUnit(unit);
+                    }}
+                    className="px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="ml/min">ml/min</option>
+                    <option value="ml/hr">ml/hr</option>
+                    <option value="ul/min">µl/min</option>
+                    <option value="ul/hr">µl/hr</option>
+                    <option value="nl/min">nl/min</option>
+                    <option value="nl/hr">nl/hr</option>
+                  </select>
+                </div>
+                <div className="flex items-center gap-1.5 mt-1.5">
+                  <input
+                    id="sync-rates-checkbox"
+                    type="checkbox"
+                    checked={syncRates}
+                    onChange={(e) => {
+                      setSyncRates(e.target.checked);
+                      if (e.target.checked) {
+                        setWithdrawRate(infuseRate);
+                        setWithdrawRateUnit(infuseRateUnit);
+                      }
+                    }}
+                    className="w-3.5 h-3.5 text-blue-600 rounded cursor-pointer"
+                  />
+                  <label htmlFor="sync-rates-checkbox" className="text-[11px] text-slate-600 cursor-pointer select-none">
+                    Link Infuse &amp; Withdraw flow rates (default identical)
+                  </label>
+                </div>
+              </div>
+
+              {/* Single Target Volume (tvolume) */}
+              <div className="pt-1">
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-semibold text-slate-700">
+                    Target Volume (tvolume / ivolume):
+                  </label>
+                  <span className="text-[11px] font-mono text-blue-700 font-semibold">
+                    Current: {telemetry.targetVolume || telemetry.strokeTarget || 0} {formatDisplayUnit(telemetry.targetUnit || 'ml')}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    id="target-volume-input"
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={targetVolume}
+                    onChange={(e) => setTargetVolume(parseFloat(e.target.value) || 0)}
+                    className="px-3 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <select
+                    id="target-volume-unit-select"
+                    value={targetVolumeUnit}
+                    onChange={(e) => setTargetVolumeUnit(e.target.value as any)}
                     className="px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   >
                     <option value="ml">ml</option>
@@ -441,49 +546,74 @@ export const BottomSection: React.FC = () => {
                     <option value="nl">nl</option>
                   </select>
                 </div>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Sets hardware <code className="font-mono text-blue-700 bg-blue-50 px-1 rounded">tvolume</code> and target stroke capacity.
+                </p>
               </div>
 
-              {/* Infuse Target & Withdraw Target */}
-              <div className="grid grid-cols-2 gap-2 pt-1">
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
-                    Infuse Target:
-                  </label>
-                  <div className="relative">
+              {/* Target Time (ttime) - only used for infuse/withdraw only */}
+              <div className="pt-2 border-t border-slate-100">
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="flex items-center gap-1.5">
                     <input
-                      id="infuse-target-input"
-                      type="number"
-                      step="0.1"
-                      min="0"
-                      value={infuseTarget}
-                      onChange={(e) => setInfuseTarget(parseFloat(e.target.value) || 0)}
-                      className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 pr-8"
+                      id="target-time-enabled-checkbox"
+                      type="checkbox"
+                      checked={targetTimeEnabled}
+                      onChange={(e) => setTargetTimeEnabled(e.target.checked)}
+                      className="w-3.5 h-3.5 text-blue-600 rounded cursor-pointer"
                     />
-                    <span className="absolute right-2 top-1.5 text-[10px] font-mono text-slate-500 pointer-events-none">
-                      {formatDisplayUnit(strokeTargetUnit)}
-                    </span>
+                    <label htmlFor="target-time-enabled-checkbox" className="text-xs font-semibold text-slate-700 cursor-pointer select-none">
+                      Enable Target Time (ttime):
+                    </label>
                   </div>
+                  <span className="text-[10px] text-amber-700 font-semibold bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
+                    Infuse/Withdraw only
+                  </span>
                 </div>
 
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
-                    Withdraw Target:
-                  </label>
-                  <div className="relative">
-                    <input
-                      id="withdraw-target-input"
-                      type="number"
-                      step="0.1"
-                      min="0"
-                      value={withdrawTarget}
-                      onChange={(e) => setWithdrawTarget(parseFloat(e.target.value) || 0)}
-                      className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 pr-8"
-                    />
-                    <span className="absolute right-2 top-1.5 text-[10px] font-mono text-slate-500 pointer-events-none">
-                      {formatDisplayUnit(strokeTargetUnit)}
-                    </span>
+                {targetTimeEnabled && (
+                  <div className="grid grid-cols-3 gap-1.5 mt-2">
+                    <div>
+                      <span className="text-[10px] text-slate-500 block mb-0.5">Hours (0-99)</span>
+                      <input
+                        id="target-time-hours-input"
+                        type="number"
+                        min="0"
+                        max="99"
+                        value={targetTimeHours}
+                        onChange={(e) => setTargetTimeHours(Math.max(0, parseInt(e.target.value, 10) || 0))}
+                        className="w-full px-2 py-1 bg-slate-50 border border-slate-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-slate-500 block mb-0.5">Mins (0-59)</span>
+                      <input
+                        id="target-time-mins-input"
+                        type="number"
+                        min="0"
+                        max="59"
+                        value={targetTimeMins}
+                        onChange={(e) => setTargetTimeMins(Math.min(59, Math.max(0, parseInt(e.target.value, 10) || 0)))}
+                        className="w-full px-2 py-1 bg-slate-50 border border-slate-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-slate-500 block mb-0.5">Secs (0-59)</span>
+                      <input
+                        id="target-time-secs-input"
+                        type="number"
+                        min="0"
+                        max="59"
+                        value={targetTimeSecs}
+                        onChange={(e) => setTargetTimeSecs(Math.min(59, Math.max(0, parseInt(e.target.value, 10) || 0)))}
+                        className="w-full px-2 py-1 bg-slate-50 border border-slate-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                    </div>
                   </div>
-                </div>
+                )}
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Limits single run by duration (<code className="font-mono text-blue-700 bg-blue-50 px-1 rounded">ttime hh:mm:ss</code>). Ignored in continuous mode.
+                </p>
               </div>
 
             </div>

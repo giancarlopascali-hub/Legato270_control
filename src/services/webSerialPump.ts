@@ -20,14 +20,24 @@ export interface PumpTelemetry {
   statusText: string;
   statusCategory: StatusCategory; // 'Idle' | 'Running' | 'Error'
   direction: 'infuse' | 'withdraw' | 'idle' | 'paused';
-  flowRate: number;
+  // Flow Rates (separate infuse and withdraw rates)
+  flowRate: number; // Active or default rate
   flowUnit: string;
+  infuseRate: number;
+  infuseRateUnit: string;
+  withdrawRate: number;
+  withdrawRateUnit: string;
+  // Single Target Volume
   targetVolume: number | null;
-  targetUnit: string;
+  targetUnit: string; // 'ml' | 'ul' | 'nl'
   volumeUnit: string; // 'ml' | 'ul' | 'nl'
   strokeTarget: number | null;
-  infuseTarget: number | null;
-  withdrawTarget: number | null;
+  infuseTarget?: number | null;
+  withdrawTarget?: number | null;
+  // Target Time
+  targetTime: string | null; // e.g. "00:05:00"
+  targetTimeEnabled: boolean;
+  // Accumulated volumes
   infusedVolume: number;
   withdrawnVolume: number;
   diameterMm: number;
@@ -36,6 +46,9 @@ export interface PumpTelemetry {
   dtrEnabled: boolean;
   rtsEnabled: boolean;
   echoEnabled: boolean;
+  // Motor Stall & Alarm state
+  isStalled: boolean;
+  stallMessage: string;
   // Continuous cycling state
   continuousActive: boolean;
   currentCycle: number;
@@ -87,20 +100,47 @@ export function formatDisplayUnit(unit: string): string {
   return clean;
 }
 
+/**
+ * Converts any volume (ml, ul, nl) to base microliters (µl) for normalized calculation
+ */
+export function toMicroliters(val: number, unit: string): number {
+  if (!val || isNaN(val)) return 0;
+  const u = normalizeSerialUnit(unit);
+  if (u === 'ml') return val * 1000;
+  if (u === 'nl') return val / 1000;
+  return val; // 'ul'
+}
+
+/**
+ * Converts volume between arbitrary units (ml, ul, nl)
+ */
+export function convertVolume(val: number, fromUnit: string, toUnit: string): number {
+  const ul = toMicroliters(val, fromUnit);
+  const target = normalizeSerialUnit(toUnit);
+  if (target === 'ml') return ul / 1000;
+  if (target === 'nl') return ul * 1000;
+  return ul; // 'ul'
+}
+
 export function isHardwarePromptOrNoise(str: string): boolean {
   if (!str) return true;
   const lower = str.toLowerCase();
   if (lower.includes('polling mode')) return true;
 
+  // Never filter out critical stall or alarm messages
+  if (str.includes('*') || str.includes('!') || lower.includes('stall') || lower.includes('alarm')) {
+    return false;
+  }
+
   // Strip non-printable ASCII and whitespace
   const clean = str.replace(/[\x00-\x1F\x7F-\x9F\s]/g, '');
   if (!clean) return true;
 
-  // Single or multiple prompt symbols (e.g. ":", ">", "<", "*", "!", "?", "O", "T*", "::", ":>")
-  if (/^[:><*!?OT]+$/i.test(clean)) return true;
+  // Normal prompts like ":", ">", "<"
+  if (/^[:><]+$/i.test(clean)) return true;
 
-  // Address with or without prompt symbols (e.g. "00:", "00>", "00<", "00*", "00T*", "00::", "00:>", "00:<")
-  if (/^\d{1,2}(:|>|<|\*|T\*|!|\?|O|::|:\s*[:><*!OT?])?$/i.test(clean)) return true;
+  // Normal address prompts like "00:", "00>", "00<"
+  if (/^\d{1,2}(:|>|<|::|:\s*[:><])?$/i.test(clean)) return true;
 
   // Bare number or address like "00"
   if (/^\d{1,2}$/.test(clean)) return true;
@@ -135,12 +175,18 @@ export class Legato270WebController {
     direction: 'idle',
     flowRate: 2.5,
     flowUnit: 'ml/min',
+    infuseRate: 2.5,
+    infuseRateUnit: 'ml/min',
+    withdrawRate: 2.5,
+    withdrawRateUnit: 'ml/min',
     targetVolume: 5.0,
     targetUnit: 'ml',
     volumeUnit: 'ml',
     strokeTarget: 5.0,
     infuseTarget: 5.0,
     withdrawTarget: 5.0,
+    targetTime: null,
+    targetTimeEnabled: false,
     infusedVolume: 0.0,
     withdrawnVolume: 0.0,
     diameterMm: 14.50,
@@ -149,6 +195,8 @@ export class Legato270WebController {
     dtrEnabled: true,
     rtsEnabled: true,
     echoEnabled: false,
+    isStalled: false,
+    stallMessage: '',
     continuousActive: false,
     currentCycle: 0,
     totalCycles: 0,
@@ -464,7 +512,7 @@ export class Legato270WebController {
   }
 
   public async queryAllPumpParameters(): Promise<void> {
-    const queryList = ['echo off', 'ver', 'diameter', 'irate', 'tvolume', 'ivolume', 'force', 'poll'];
+    const queryList = ['echo off', 'ver', 'diameter', 'irate', 'wrate', 'tvolume', 'ttime', 'ivolume', 'wvolume', 'force', 'poll'];
     for (const cmd of queryList) {
       await this.sendCommand(cmd, false);
       await new Promise((r) => setTimeout(r, 70));
@@ -474,14 +522,62 @@ export class Legato270WebController {
   private handleIncomingLine(line: string) {
     this.state.lastResponse = line;
 
-    // Suppress raw periodic poll prompt echoes (e.g. ":", "00:", "00>", "00<", "00*", "Polling mode is ON")
-    // from cluttering the terminal while keeping meaningful responses and manual commands visible
+    // Suppress raw periodic poll prompt echoes (e.g. ":", "00:", "00>", "00<", "Polling mode is ON")
+    // from cluttering the terminal while keeping meaningful responses, stall alerts, and manual commands visible
     if (!isHardwarePromptOrNoise(line)) {
       this.emitLog('rx', line);
     }
 
-    // Parse pump version (e.g. "KD Scientific Legato 200 v2.1.0" or "00:KD Scientific Legato 270")
-    if (line.includes('KD Scientific') || line.includes('Harvard') || line.includes('Legato') || line.toLowerCase().includes('syringe pump')) {
+    const lineLower = line.toLowerCase();
+
+    // 1. Direct text or prompt-based stall & alarm detection from hardware
+    const isStallAlarmText =
+      lineLower.includes('stall') ||
+      lineLower.includes('stalled') ||
+      lineLower.includes('motor stall') ||
+      lineLower.includes('error 101') ||
+      lineLower.includes('error 102') ||
+      lineLower.includes('err 101') ||
+      lineLower.includes('err 102') ||
+      lineLower.includes('alarm') ||
+      lineLower.includes('overpressure') ||
+      lineLower.includes('limit reached');
+
+    const isStallPrompt =
+      line.endsWith('*') ||
+      line.endsWith('!') ||
+      line === '*' ||
+      line === '!' ||
+      line === '00*' ||
+      line === '00!' ||
+      line.includes('00:*') ||
+      line.includes('00:!');
+
+    if (isStallAlarmText || isStallPrompt) {
+      // Check if it is T* (target reached) vs * / ! (stall)
+      if (line.endsWith('T*') || line.includes('00T*') || line.includes('00:T*') || lineLower.includes('target reached')) {
+        this.state.statusText = 'TARGET REACHED';
+        this.state.statusCategory = 'Idle';
+        this.state.prompt = 'T*';
+        this.state.direction = 'idle';
+        this.state.isStalled = false;
+        this.stopRunClock();
+      } else {
+        this.state.isStalled = true;
+        this.state.stallMessage = line;
+        this.state.statusCategory = 'Error';
+        this.state.statusText = 'MOTOR STALLED / ALARM';
+        this.state.prompt = line.includes('!') ? '!' : '*';
+        this.state.direction = 'idle';
+        this.stopRunClock();
+        this.emitLog('error', `[!] PUMP MOTOR STALL / ALARM DETECTED: ${line}`);
+        this.emitTelemetry();
+        return;
+      }
+    }
+
+    // 2. Parse pump model & version (e.g. "KD Scientific Legato 270 v2.1.0" or "00:KD Scientific Legato 270")
+    if (line.includes('KD Scientific') || line.includes('Harvard') || line.includes('Legato') || lineLower.includes('syringe pump')) {
       this.state.pumpModel = line.replace(/^\d+[:\s]*/, '').trim();
       const vMatch = line.match(/v\d+\.\d+(\.\d+)?/i);
       if (vMatch) {
@@ -489,33 +585,13 @@ export class Legato270WebController {
       }
     }
 
-    // Extract address prefix if present (e.g. "00:", "01:", "00>")
+    // 3. Extract address prefix if present (e.g. "00:", "01:", "00>")
     const addrMatch = line.match(/^(\d{2}):/);
     if (addrMatch) {
       this.state.pumpAddress = addrMatch[1];
     }
 
-    // Direct text-based stall & alarm detection from hardware messages
-    const lineLower = line.toLowerCase();
-    if (
-      lineLower.includes('stall') ||
-      lineLower.includes('stalled') ||
-      lineLower.includes('motor stall') ||
-      lineLower.includes('error 101') ||
-      lineLower.includes('error 102') ||
-      lineLower.includes('err 101') ||
-      lineLower.includes('err 102')
-    ) {
-      this.state.statusCategory = 'Error';
-      this.state.statusText = 'MOTOR STALLED';
-      this.state.direction = 'idle';
-      this.stopRunClock();
-      this.emitLog('error', `[!] PUMP MOTOR STALL DETECTED: ${line}`);
-      this.emitTelemetry();
-      return;
-    }
-
-    // Extract prompt from line (e.g. 00:, 00>, 00<, 00*, 00T*, 00!, 00O, 00?)
+    // 4. Extract prompt from line (e.g. 00:, 00>, 00<, 00*, 00T*, 00!, 00O, 00?)
     const promptMatch = line.match(/(T\*|[:><*!O?])$/);
     if (promptMatch) {
       const p = promptMatch[1] as PumpStatusPrompt;
@@ -523,14 +599,34 @@ export class Legato270WebController {
       this.updateStatusFromPrompt(p);
     }
 
-    // Parse rate (e.g. "2.5000 ml/min", "500.0000 ul/min", "100.0 µl/hr", "50 nl/min", "00:2.5000 ml/min")
+    // 5. Rate parsing (e.g. "2.5000 ml/min", "500.0000 ul/min", "100.0 µl/hr", "50 nl/min", "00:2.5000 ml/min")
     const rateMatch = line.match(/([\d.]+)\s*(ml\/min|ml\/hr|ml\/sec|ul\/min|ul\/hr|ul\/sec|µl\/min|µl\/hr|µl\/sec|μl\/min|μl\/hr|μl\/sec|nl\/min|nl\/hr|nl\/sec)/i);
     if (rateMatch) {
-      this.state.flowRate = parseFloat(rateMatch[1]);
-      this.state.flowUnit = normalizeSerialUnit(rateMatch[2]);
+      const rateVal = parseFloat(rateMatch[1]);
+      const rateUnit = normalizeSerialUnit(rateMatch[2]);
+      if (this.state.lastCommand?.toLowerCase().startsWith('wrate') || lineLower.includes('wrate')) {
+        this.state.withdrawRate = rateVal;
+        this.state.withdrawRateUnit = rateUnit;
+      } else if (this.state.lastCommand?.toLowerCase().startsWith('irate') || lineLower.includes('irate')) {
+        this.state.infuseRate = rateVal;
+        this.state.infuseRateUnit = rateUnit;
+        this.state.flowRate = rateVal;
+        this.state.flowUnit = rateUnit;
+      } else {
+        // General rate response
+        this.state.flowRate = rateVal;
+        this.state.flowUnit = rateUnit;
+        if (this.state.direction === 'withdraw') {
+          this.state.withdrawRate = rateVal;
+          this.state.withdrawRateUnit = rateUnit;
+        } else {
+          this.state.infuseRate = rateVal;
+          this.state.infuseRateUnit = rateUnit;
+        }
+      }
     }
 
-    // Parse syringe diameter (e.g. "14.500 mm" or "00:14.500 mm")
+    // 6. Parse syringe diameter (e.g. "14.500 mm" or "00:14.500 mm")
     if (line.includes('mm')) {
       const match = line.match(/([\d.]+)\s*mm/i);
       if (match) {
@@ -538,8 +634,12 @@ export class Legato270WebController {
       }
     }
 
-    // Parse target volume (e.g. "5.0000 ml", "500.0 ul", "10.0 µl", "00:5.0000 ml" or "tvolume: 5 ml")
-    if (lineLower.includes('tvol') || (!lineLower.includes('ivol') && !lineLower.includes('wvol') && !lineLower.includes('/') && line.match(/[\d.]+\s*(ml|ul|µl|μl|nl)$/i))) {
+    // 7. Parse target volume (e.g. "5.0000 ml", "500.0 ul", "10.0 µl", "00:5.0000 ml" or "tvolume: 5 ml")
+    if (
+      this.state.lastCommand?.toLowerCase().startsWith('tvolume') ||
+      lineLower.includes('tvol') ||
+      (!lineLower.includes('ivol') && !lineLower.includes('wvol') && !lineLower.includes('/') && !lineLower.includes(':') && line.match(/[\d.]+\s*(ml|ul|µl|μl|nl)$/i))
+    ) {
       const match = line.match(/([\d.]+)\s*(ml|ul|µl|μl|nl)\b/i);
       if (match && !lineLower.includes('ivol') && !lineLower.includes('wvol')) {
         const val = parseFloat(match[1]);
@@ -550,8 +650,21 @@ export class Legato270WebController {
       }
     }
 
-    // Parse infused volume (e.g. "ivolume 0.5000 ml", "00:50.0000 ul", "0.5000 µl")
-    if (lineLower.includes('ivol') || (this.state.direction === 'infuse' && !lineLower.includes('/') && line.match(/[\d.]+\s*(ml|ul|µl|μl|nl)/i))) {
+    // 8. Parse target time (e.g. "00:05:00" or "0:5:0")
+    if (this.state.lastCommand?.toLowerCase().startsWith('ttime') || lineLower.includes('ttime')) {
+      const timeMatch = line.match(/(\d{1,2}:\d{2}:\d{2})/);
+      if (timeMatch) {
+        this.state.targetTime = timeMatch[1];
+        this.state.targetTimeEnabled = true;
+      }
+    }
+
+    // 9. Parse infused volume (e.g. "ivolume 0.5000 ml", "00:50.0000 ul", "0.5000 µl")
+    if (
+      this.state.lastCommand === 'ivolume' ||
+      lineLower.includes('ivol') ||
+      (this.state.direction === 'infuse' && !lineLower.includes('/') && line.match(/[\d.]+\s*(ml|ul|µl|μl|nl)/i))
+    ) {
       const match = line.match(/([\d.]+)\s*(ml|ul|µl|μl|nl)/i);
       if (match) {
         this.state.infusedVolume = parseFloat(match[1]);
@@ -559,8 +672,12 @@ export class Legato270WebController {
       }
     }
 
-    // Parse withdrawn volume (e.g. "wvolume 0.5000 ml", "00:50.0000 ul", "0.5000 µl")
-    if (lineLower.includes('wvol') || (this.state.direction === 'withdraw' && !lineLower.includes('/') && line.match(/[\d.]+\s*(ml|ul|µl|μl|nl)/i))) {
+    // 10. Parse withdrawn volume (e.g. "wvolume 0.5000 ml", "00:50.0000 ul", "0.5000 µl")
+    if (
+      this.state.lastCommand === 'wvolume' ||
+      lineLower.includes('wvol') ||
+      (this.state.direction === 'withdraw' && !lineLower.includes('/') && line.match(/[\d.]+\s*(ml|ul|µl|μl|nl)/i))
+    ) {
       const match = line.match(/([\d.]+)\s*(ml|ul|µl|μl|nl)/i);
       if (match) {
         this.state.withdrawnVolume = parseFloat(match[1]);
@@ -568,7 +685,7 @@ export class Legato270WebController {
       }
     }
 
-    // Parse force
+    // 11. Parse force
     if (lineLower.includes('force') || line.match(/(\d+)\s*%/)) {
       const match = line.match(/(\d+)\s*%/);
       if (match) {
@@ -576,23 +693,22 @@ export class Legato270WebController {
       }
     }
 
-    // Calculate carriage position percentage dynamically
-    const activeTarget = (this.state.targetVolume && this.state.targetVolume > 0)
-      ? this.state.targetVolume
-      : (this.state.strokeTarget && this.state.strokeTarget > 0 ? this.state.strokeTarget : 10.0);
+    // 12. Calculate carriage position percentage dynamically using normalized units
+    const targetInUl = this.state.targetVolume && this.state.targetVolume > 0
+      ? toMicroliters(this.state.targetVolume, this.state.targetUnit || 'ml')
+      : 10000;
 
-    if (this.state.direction === 'withdraw') {
-      const pct = (this.state.withdrawnVolume / activeTarget) * 100;
-      this.state.carriagePercent = Math.max(0, Math.min(100, Math.round(pct * 10) / 10));
-    } else {
-      const pct = (this.state.infusedVolume / activeTarget) * 100;
-      this.state.carriagePercent = Math.max(0, Math.min(100, Math.round(pct * 10) / 10));
-    }
+    const currentVolInUl = this.state.direction === 'withdraw'
+      ? toMicroliters(this.state.withdrawnVolume, this.state.volumeUnit || 'ml')
+      : toMicroliters(this.state.infusedVolume, this.state.volumeUnit || 'ml');
+
+    const pct = targetInUl > 0 ? (currentVolInUl / targetInUl) * 100 : 0;
+    this.state.carriagePercent = Math.max(0, Math.min(100, Math.round(pct * 10) / 10));
 
     this.emitTelemetry();
 
-    // Check if continuous push/pull cycle transition is needed
-    if (this.state.continuousActive && this.state.prompt === 'T*') {
+    // 13. Continuous push/pull cycle transition check
+    if (this.state.continuousActive && (this.state.prompt === 'T*' || this.state.statusText === 'TARGET REACHED')) {
       this.handleContinuousTargetReached();
     }
   }
@@ -907,8 +1023,15 @@ export class Legato270WebController {
     this.state.prompt = '>';
     this.state.statusText = 'INFUSING';
     this.state.statusCategory = 'Running';
+    this.state.isStalled = false;
+    this.state.stallMessage = '';
     this.startRunClock();
     this.emitTelemetry();
+
+    // Ensure infuse rate is synchronized to hardware before run
+    const unit = normalizeSerialUnit(this.state.infuseRateUnit || this.state.flowUnit || 'ml/min');
+    const rate = this.state.infuseRate || this.state.flowRate || 2.5;
+    await this.sendCommand(`irate ${rate} ${unit}`);
     await this.sendCommand('irun');
   }
 
@@ -917,8 +1040,15 @@ export class Legato270WebController {
     this.state.prompt = '<';
     this.state.statusText = 'WITHDRAWING';
     this.state.statusCategory = 'Running';
+    this.state.isStalled = false;
+    this.state.stallMessage = '';
     this.startRunClock();
     this.emitTelemetry();
+
+    // CRITICAL: Ensure withdraw rate (wrate) is synchronized to hardware before wrun!
+    const unit = normalizeSerialUnit(this.state.withdrawRateUnit || this.state.flowUnit || 'ml/min');
+    const rate = this.state.withdrawRate || this.state.flowRate || 2.5;
+    await this.sendCommand(`wrate ${rate} ${unit}`);
     await this.sendCommand('wrun');
   }
 
@@ -929,6 +1059,8 @@ export class Legato270WebController {
     this.state.prompt = ':';
     this.state.statusText = 'STOPPED';
     this.state.statusCategory = 'Idle';
+    this.state.isStalled = false;
+    this.state.stallMessage = '';
     this.stopRunClock();
     if (this.programAbortController) {
       this.programAbortController.abort();
@@ -944,13 +1076,13 @@ export class Legato270WebController {
     this.state.withdrawnVolume = 0.0;
     this.state.elapsedRunTimeSec = 0;
     this.state.carriagePercent = 0;
-    if (this.state.statusText.includes('STALL') || this.state.statusCategory === 'Error') {
-      this.state.statusText = 'STOPPED (Idle)';
-      this.state.statusCategory = 'Idle';
-      this.state.prompt = ':';
-    }
+    this.state.isStalled = false;
+    this.state.stallMessage = '';
+    this.state.statusText = 'STOPPED (Idle)';
+    this.state.statusCategory = 'Idle';
+    this.state.prompt = ':';
     this.emitTelemetry();
-    this.emitLog('info', '[i] Counters reset locally and clearing pump hardware registers...');
+    this.emitLog('info', '[i] Counters reset and clearing pump hardware registers...');
 
     // 2. Transmit hardware clear commands to pump
     if (this.state.isRealHardware && this.port && this.port.writable) {
@@ -968,12 +1100,18 @@ export class Legato270WebController {
     diameterMm?: number;
     flowRate?: number;
     flowUnit?: string;
+    infuseRate?: number;
+    infuseRateUnit?: string;
+    withdrawRate?: number;
+    withdrawRateUnit?: string;
     targetVolume?: number | null;
     targetUnit?: string;
     volumeUnit?: string;
     strokeTarget?: number | null;
     infuseTarget?: number | null;
     withdrawTarget?: number | null;
+    targetTime?: string | null;
+    targetTimeEnabled?: boolean;
     motorForce?: number;
     baudRate?: number;
   }) {
@@ -988,28 +1126,54 @@ export class Legato270WebController {
     if (params.volumeUnit !== undefined) {
       this.state.volumeUnit = normalizeSerialUnit(params.volumeUnit);
     }
-    if (params.flowRate !== undefined && params.flowUnit !== undefined) {
-      this.state.flowRate = params.flowRate;
-      this.state.flowUnit = normalizeSerialUnit(params.flowUnit);
-      const unitToSend = normalizeSerialUnit(params.flowUnit);
-      await this.sendCommand(`irate ${params.flowRate} ${unitToSend}`);
+
+    // Handle Infuse Rate
+    const infRate = params.infuseRate ?? params.flowRate;
+    const infUnit = normalizeSerialUnit(params.infuseRateUnit ?? params.flowUnit ?? this.state.infuseRateUnit ?? 'ml/min');
+    if (infRate !== undefined) {
+      this.state.infuseRate = infRate;
+      this.state.infuseRateUnit = infUnit;
+      this.state.flowRate = infRate;
+      this.state.flowUnit = infUnit;
+      await this.sendCommand(`irate ${infRate} ${infUnit}`);
     }
+
+    // Handle Withdraw Rate
+    const wthRate = params.withdrawRate ?? params.flowRate ?? this.state.withdrawRate;
+    const wthUnit = normalizeSerialUnit(params.withdrawRateUnit ?? params.flowUnit ?? this.state.withdrawRateUnit ?? 'ml/min');
+    if (wthRate !== undefined) {
+      this.state.withdrawRate = wthRate;
+      this.state.withdrawRateUnit = wthUnit;
+      await this.sendCommand(`wrate ${wthRate} ${wthUnit}`);
+    }
+
+    // Handle Target Volume (Single tvolume for the pump)
     if (params.targetVolume !== undefined) {
       this.state.targetVolume = params.targetVolume;
       this.state.strokeTarget = params.strokeTarget ?? params.targetVolume;
+      this.state.infuseTarget = params.targetVolume;
+      this.state.withdrawTarget = params.targetVolume;
       if (params.targetVolume === null || params.targetVolume <= 0) {
         await this.sendCommand('ctvolume');
       } else {
-        const unit = normalizeSerialUnit(this.state.targetUnit || 'ml');
+        const unit = normalizeSerialUnit(params.targetUnit || this.state.targetUnit || 'ml');
         await this.sendCommand(`tvolume ${params.targetVolume} ${unit}`);
       }
     }
-    if (params.infuseTarget !== undefined) {
-      this.state.infuseTarget = params.infuseTarget;
+
+    // Handle Target Time (Used only for single infuse/withdraw modes, not continuous)
+    if (params.targetTimeEnabled !== undefined) {
+      this.state.targetTimeEnabled = params.targetTimeEnabled;
     }
-    if (params.withdrawTarget !== undefined) {
-      this.state.withdrawTarget = params.withdrawTarget;
+    if (params.targetTime !== undefined) {
+      this.state.targetTime = params.targetTime;
     }
+    if (this.state.targetTimeEnabled && this.state.targetTime) {
+      await this.sendCommand(`ttime ${this.state.targetTime}`);
+    } else if (params.targetTimeEnabled === false || params.targetTime === null) {
+      await this.sendCommand('cttime');
+    }
+
     if (params.motorForce !== undefined) {
       this.state.motorForce = params.motorForce;
       await this.sendCommand(`force ${params.motorForce}`);
@@ -1018,6 +1182,7 @@ export class Legato270WebController {
       this.state.baudRate = params.baudRate;
       await this.sendCommand(`baud ${params.baudRate}`);
     }
+
     this.emitTelemetry();
     await this.sendCommand('poll', false);
   }
@@ -1030,23 +1195,44 @@ export class Legato270WebController {
     flowRate: number,
     flowUnit: string,
     strokeVolume: number,
-    totalCycles: number = 0
+    totalCycles: number = 0,
+    withdrawRate?: number,
+    withdrawRateUnit?: string,
+    volumeUnit: string = 'ml'
   ) {
+    const infUnit = normalizeSerialUnit(flowUnit);
+    const wthUnit = normalizeSerialUnit(withdrawRateUnit || flowUnit);
+    const volUnit = normalizeSerialUnit(volumeUnit || this.state.volumeUnit || 'ml');
+    const wRate = withdrawRate ?? flowRate;
+
     this.state.continuousActive = true;
     this.state.currentCycle = 1;
     this.state.totalCycles = totalCycles;
     this.state.flowRate = flowRate;
-    this.state.flowUnit = flowUnit;
+    this.state.flowUnit = infUnit;
+    this.state.infuseRate = flowRate;
+    this.state.infuseRateUnit = infUnit;
+    this.state.withdrawRate = wRate;
+    this.state.withdrawRateUnit = wthUnit;
     this.state.targetVolume = strokeVolume;
     this.state.strokeTarget = strokeVolume;
+    this.state.targetUnit = volUnit;
+    this.state.volumeUnit = volUnit;
     this.state.cyclePhase = 'infusing_A';
+    this.state.isStalled = false;
+    this.state.stallMessage = '';
 
-    this.emitLog('cycle', `[+] STARTING CONTINUOUS PUSH/PULL (Rate: ${flowRate} ${flowUnit}, Stroke: ${strokeVolume} ml, Cycles: ${totalCycles === 0 ? 'Infinite (24/7)' : totalCycles})`);
+    this.emitLog(
+      'cycle',
+      `[+] STARTING CONTINUOUS PUSH/PULL (Infuse: ${flowRate} ${infUnit}, Withdraw: ${wRate} ${wthUnit}, Stroke: ${strokeVolume} ${volUnit}, Cycles: ${totalCycles === 0 ? 'Infinite (24/7)' : totalCycles})`
+    );
 
     await this.sendCommand('stop');
-    await this.sendCommand(`irate ${flowRate} ${flowUnit}`);
-    await this.sendCommand(`wrate ${flowRate} ${flowUnit}`);
-    await this.sendCommand(`tvolume ${strokeVolume} ml`);
+    // Clear any hardware timer target to ensure continuous cycles run without unexpected time stops
+    await this.sendCommand('cttime');
+    await this.sendCommand(`irate ${flowRate} ${infUnit}`);
+    await this.sendCommand(`wrate ${wRate} ${wthUnit}`);
+    await this.sendCommand(`tvolume ${strokeVolume} ${volUnit}`);
     await this.sendCommand('cvolume');
 
     this.state.infusedVolume = 0;
