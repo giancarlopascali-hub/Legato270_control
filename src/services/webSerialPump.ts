@@ -424,7 +424,14 @@ export class Legato270WebController {
 
   private handleIncomingLine(line: string) {
     this.state.lastResponse = line;
-    this.emitLog('rx', line);
+
+    // Suppress raw periodic poll echo/prompts (e.g. "00:", "00>", "00<", "00*", ":", ">", "<", "Polling mode is ON")
+    // from cluttering the terminal while keeping meaningful responses and manual commands visible
+    const isBarePrompt = /^\d{0,2}[:><*!?O]$/.test(line.trim());
+    const isPollingModeMsg = line.toLowerCase().includes('polling mode');
+    if (!isBarePrompt && !isPollingModeMsg) {
+      this.emitLog('rx', line);
+    }
 
     // Parse pump version (e.g. "KD Scientific Legato 200 v2.1.0" or "00:KD Scientific Legato 270")
     if (line.includes('KD Scientific') || line.includes('Harvard') || line.includes('Legato') || line.toLowerCase().includes('syringe pump')) {
@@ -622,6 +629,8 @@ export class Legato270WebController {
           } finally {
             writer.releaseLock();
           }
+          // Small inter-command guard delay to let the pump's microcontroller process
+          await new Promise((r) => setTimeout(r, 60));
         } catch (err: any) {
           this.emitLog('error', `Write error: ${err.message}`);
           this.state.statusCategory = 'Error';

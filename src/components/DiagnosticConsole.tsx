@@ -34,6 +34,10 @@ export const DiagnosticConsole: React.FC = () => {
 
     const unsubTelemetry = pumpController.subscribeTelemetry((t) => setTelemetry(t));
     const unsubLogs = pumpController.subscribeLog((log) => {
+      // Filter out any "Polling mode is ON" or bare prompt noise from the terminal
+      if (log.text.toLowerCase().includes('polling mode is on') || log.text.trim() === ':') {
+        return;
+      }
       setLogs((prev) => [...prev.slice(-250), log]);
     });
 
