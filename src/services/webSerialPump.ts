@@ -60,6 +60,27 @@ export interface SerialLogItem {
 export type TelemetryListener = (telemetry: PumpTelemetry) => void;
 export type LogListener = (log: SerialLogItem) => void;
 
+export function isHardwarePromptOrNoise(str: string): boolean {
+  if (!str) return true;
+  const lower = str.toLowerCase();
+  if (lower.includes('polling mode')) return true;
+
+  // Strip non-printable ASCII and whitespace
+  const clean = str.replace(/[\x00-\x1F\x7F-\x9F\s]/g, '');
+  if (!clean) return true;
+
+  // Single or multiple prompt symbols (e.g. ":", ">", "<", "*", "!", "?", "O", "T*", "::", ":>")
+  if (/^[:><*!?OT]+$/i.test(clean)) return true;
+
+  // Address with or without prompt symbols (e.g. "00:", "00>", "00<", "00*", "00T*", "00::", "00:>", "00:<")
+  if (/^\d{1,2}(:|>|<|\*|T\*|!|\?|O|::|:\s*[:><*!OT?])?$/i.test(clean)) return true;
+
+  // Bare number or address like "00"
+  if (/^\d{1,2}$/.test(clean)) return true;
+
+  return false;
+}
+
 export class Legato270WebController {
   private port: any = null;
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -415,7 +436,7 @@ export class Legato270WebController {
   }
 
   public async queryAllPumpParameters(): Promise<void> {
-    const queryList = ['echo off', 'ver', 'diameter', 'irate', 'wrate', 'tvolume', 'ivolume', 'wvolume', 'force', 'poll'];
+    const queryList = ['echo off', 'ver', 'diameter', 'irate', 'tvolume', 'ivolume', 'force', 'poll'];
     for (const cmd of queryList) {
       await this.sendCommand(cmd, false);
       await new Promise((r) => setTimeout(r, 70));
@@ -425,11 +446,9 @@ export class Legato270WebController {
   private handleIncomingLine(line: string) {
     this.state.lastResponse = line;
 
-    // Suppress raw periodic poll echo/prompts (e.g. "00:", "00>", "00<", "00*", ":", ">", "<", "Polling mode is ON")
+    // Suppress raw periodic poll prompt echoes (e.g. ":", "00:", "00>", "00<", "00*", "Polling mode is ON")
     // from cluttering the terminal while keeping meaningful responses and manual commands visible
-    const isBarePrompt = /^\d{0,2}[:><*!?O]$/.test(line.trim());
-    const isPollingModeMsg = line.toLowerCase().includes('polling mode');
-    if (!isBarePrompt && !isPollingModeMsg) {
+    if (!isHardwarePromptOrNoise(line)) {
       this.emitLog('rx', line);
     }
 
@@ -576,12 +595,13 @@ export class Legato270WebController {
     this.pollTimer = setInterval(async () => {
       if (this.state.isRealHardware && this.state.isConnected) {
         await this.sendCommand('poll', false);
-        if (this.state.direction !== 'idle') {
+        if (this.state.direction === 'infuse') {
           await this.sendCommand('ivolume', false);
+        } else if (this.state.direction === 'withdraw') {
           await this.sendCommand('wvolume', false);
         }
       }
-    }, 650);
+    }, 750);
   }
 
   private stopHardwarePolling() {
@@ -830,21 +850,7 @@ export class Legato270WebController {
   // High-Level Motion Commands
   // -------------------------------------------------------------------------
 
-  public async infuse(rate?: number, unit?: string, target?: number) {
-    if (rate !== undefined && unit !== undefined) {
-      this.state.flowRate = rate;
-      this.state.flowUnit = unit;
-      await this.sendCommand(`irate ${rate} ${unit}`);
-    }
-    if (target !== undefined) {
-      if (target > 0) {
-        this.state.targetVolume = target;
-        this.state.strokeTarget = target;
-        await this.sendCommand(`tvolume ${target} ml`);
-      } else {
-        await this.sendCommand('ctvolume');
-      }
-    }
+  public async infuse() {
     this.state.direction = 'infuse';
     this.state.prompt = '>';
     this.state.statusText = 'INFUSING';
@@ -854,21 +860,7 @@ export class Legato270WebController {
     await this.sendCommand('irun');
   }
 
-  public async withdraw(rate?: number, unit?: string, target?: number) {
-    if (rate !== undefined && unit !== undefined) {
-      this.state.flowRate = rate;
-      this.state.flowUnit = unit;
-      await this.sendCommand(`wrate ${rate} ${unit}`);
-    }
-    if (target !== undefined) {
-      if (target > 0) {
-        this.state.targetVolume = target;
-        this.state.strokeTarget = target;
-        await this.sendCommand(`tvolume ${target} ml`);
-      } else {
-        await this.sendCommand('ctvolume');
-      }
-    }
+  public async withdraw() {
     this.state.direction = 'withdraw';
     this.state.prompt = '<';
     this.state.statusText = 'WITHDRAWING';
@@ -911,7 +903,6 @@ export class Legato270WebController {
       this.state.flowRate = params.flowRate;
       this.state.flowUnit = params.flowUnit;
       await this.sendCommand(`irate ${params.flowRate} ${params.flowUnit}`);
-      await this.sendCommand(`wrate ${params.flowRate} ${params.flowUnit}`);
     }
     if (params.targetVolume !== undefined) {
       this.state.targetVolume = params.targetVolume;

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { pumpController, PumpTelemetry, SerialLogItem, Legato270WebController } from '../services/webSerialPump';
+import { pumpController, PumpTelemetry, SerialLogItem, Legato270WebController, isHardwarePromptOrNoise } from '../services/webSerialPump';
 import {
   Terminal,
   Send,
@@ -35,7 +35,7 @@ export const DiagnosticConsole: React.FC = () => {
     const unsubTelemetry = pumpController.subscribeTelemetry((t) => setTelemetry(t));
     const unsubLogs = pumpController.subscribeLog((log) => {
       // Filter out any "Polling mode is ON" or bare prompt noise from the terminal
-      if (log.text.toLowerCase().includes('polling mode is on') || log.text.trim() === ':') {
+      if (log.type === 'rx' && isHardwarePromptOrNoise(log.text)) {
         return;
       }
       setLogs((prev) => [...prev.slice(-250), log]);
