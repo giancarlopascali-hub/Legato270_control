@@ -72,14 +72,30 @@ export const TopSection: React.FC = () => {
   const infInUl = toMicroliters(telemetry.infusedVolume, telemetry.volumeUnit || telemetry.targetUnit || 'ml');
   const wthInUl = toMicroliters(telemetry.withdrawnVolume, telemetry.volumeUnit || telemetry.targetUnit || 'ml');
 
-  // Dynamic fill calculation for Syringe A (Forward Infuse): starts full, drains as infusedVolume accumulates
-  const deliveredRatioA = targetInUl > 0 ? Math.min(1, Math.max(0, infInUl / targetInUl)) : 0;
-  const fluidPercentA = Math.max(0, Math.min(100, (1 - deliveredRatioA) * 100));
-  const plungerPositionA = fluidPercentA;
+  // Dynamic fill calculation for Syringe A and Syringe B
+  let fluidPercentA = 100;
+  let fluidPercentB = 0;
 
-  // Dynamic fill calculation for Syringe B (Reverse Infuse / Refill): refills as withdrawnVolume accumulates
-  const deliveredRatioB = targetInUl > 0 ? Math.min(1, Math.max(0, wthInUl / targetInUl)) : 0;
-  const fluidPercentB = Math.max(0, Math.min(100, deliveredRatioB * 100));
+  if (telemetry.continuousActive) {
+    if (telemetry.cyclePhase === 'infusing_A' || telemetry.direction === 'infuse') {
+      const ratio = targetInUl > 0 ? Math.min(1, Math.max(0, infInUl / targetInUl)) : 0;
+      fluidPercentA = Math.max(0, Math.min(100, (1 - ratio) * 100)); // Syringe A dispensing (drains 100% -> 0%)
+      fluidPercentB = Math.max(0, Math.min(100, ratio * 100));       // Syringe B refilling (fills 0% -> 100%)
+    } else {
+      const ratio = targetInUl > 0 ? Math.min(1, Math.max(0, wthInUl / targetInUl)) : 0;
+      fluidPercentB = Math.max(0, Math.min(100, (1 - ratio) * 100)); // Syringe B dispensing (drains 100% -> 0%)
+      fluidPercentA = Math.max(0, Math.min(100, ratio * 100));       // Syringe A refilling (fills 0% -> 100%)
+    }
+  } else {
+    // Single stroke mode
+    const deliveredRatioA = targetInUl > 0 ? Math.min(1, Math.max(0, infInUl / targetInUl)) : 0;
+    fluidPercentA = Math.max(0, Math.min(100, (1 - deliveredRatioA) * 100));
+    
+    const deliveredRatioB = targetInUl > 0 ? Math.min(1, Math.max(0, wthInUl / targetInUl)) : 0;
+    fluidPercentB = Math.max(0, Math.min(100, deliveredRatioB * 100));
+  }
+
+  const plungerPositionA = fluidPercentA;
   const plungerPositionB = fluidPercentB;
 
   const isStalled =
@@ -88,6 +104,9 @@ export const TopSection: React.FC = () => {
     telemetry.statusCategory === 'Error' ||
     telemetry.prompt === '*' ||
     telemetry.prompt === '!';
+
+  // Calculate estimated stroke countdown for active stroke
+  const strokeRemainingSec = Math.max(0, telemetry.strokeDurationSec - telemetry.strokeElapsedSec);
 
   return (
     <section id="top-section" className="space-y-4">
@@ -129,6 +148,62 @@ export const TopSection: React.FC = () => {
             >
               Reset Counters
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Active Continuous Mode Header Banner */}
+      {telemetry.continuousActive && (
+        <div
+          id="continuous-cycle-status-banner"
+          className="bg-indigo-50 border-2 border-indigo-500/40 rounded-xl p-4 text-indigo-950 shadow-xs"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-lg bg-indigo-600 text-white flex items-center justify-center shrink-0 shadow-xs animate-spin">
+                <RefreshCw className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="px-2 py-0.5 rounded-full bg-indigo-600 text-white font-mono font-bold text-[10px] uppercase">
+                    Continuous Push/Pull Active
+                  </span>
+                  <span className="font-mono font-bold text-xs text-indigo-900">
+                    Cycle #{telemetry.currentCycle} {telemetry.totalCycles > 0 ? `/ ${telemetry.totalCycles}` : '(24/7 Infinite)'}
+                  </span>
+                </div>
+                <p className="text-xs text-indigo-800 font-semibold mt-1">
+                  {telemetry.cyclePhase === 'infusing_A' || telemetry.direction === 'infuse'
+                    ? 'Phase 1: Syringe A Infusing to Output &bull; Syringe B Refilling from Reservoir'
+                    : 'Phase 2: Syringe B Infusing to Output &bull; Syringe A Refilling from Reservoir'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 sm:text-right">
+              <div className="bg-white/80 border border-indigo-200 rounded-lg px-3 py-1.5 font-mono text-xs">
+                <span className="text-[10px] uppercase font-bold text-slate-500 block">Total Combined Fluid Delivered</span>
+                <strong className="text-indigo-700 text-sm">{telemetry.totalContinuousVolume.toFixed(4)} {volUnit}</strong>
+              </div>
+              <div className="bg-white/80 border border-indigo-200 rounded-lg px-3 py-1.5 font-mono text-xs">
+                <span className="text-[10px] uppercase font-bold text-slate-500 block">Stroke Countdown</span>
+                <strong className="text-slate-800">{formatTimer(Math.round(strokeRemainingSec))}</strong>
+              </div>
+            </div>
+          </div>
+
+          {/* Stroke Progress Bar */}
+          <div className="mt-3 pt-2 border-t border-indigo-200/60 flex items-center gap-3 text-xs font-mono">
+            <span className="text-slate-600 shrink-0 text-[11px]">Stroke Progress:</span>
+            <div className="h-2.5 flex-1 bg-indigo-200/80 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-indigo-600 transition-all duration-150 rounded-full"
+                style={{ width: `${telemetry.strokePercent}%` }}
+              />
+            </div>
+            <span className="font-bold text-indigo-800 shrink-0 text-[11px]">
+              {telemetry.strokePercent.toFixed(1)}% ({formatTimer(Math.round(telemetry.strokeElapsedSec))} / {formatTimer(Math.round(telemetry.strokeDurationSec))})
+            </span>
           </div>
         </div>
       )}
@@ -224,9 +299,17 @@ export const TopSection: React.FC = () => {
               Dual-Syringe Mechanical Visualizer (Opposed Push/Pull)
             </h2>
           </div>
-          <div className="flex items-center gap-2 text-xs font-mono text-slate-500">
-            <span>Carriage Travel:</span>
-            <strong className="text-blue-700 font-bold">{telemetry.carriagePercent.toFixed(1)}%</strong>
+          <div className="flex items-center gap-3 text-xs font-mono">
+            <div className="flex items-center gap-1 text-slate-500">
+              <span>Carriage Travel:</span>
+              <strong className="text-blue-700 font-bold">{telemetry.carriagePercent.toFixed(1)}%</strong>
+            </div>
+            {telemetry.targetVolume && (
+              <div className="hidden sm:flex items-center gap-1 text-slate-500 border-l border-slate-200 pl-3">
+                <span>Stroke Target:</span>
+                <strong className="text-slate-800 font-bold">{telemetry.targetVolume} {volUnit}</strong>
+              </div>
+            )}
           </div>
         </div>
 
@@ -239,30 +322,39 @@ export const TopSection: React.FC = () => {
               <div className="flex items-center gap-2">
                 <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
                 <span className="font-semibold text-slate-900">Syringe A (Forward Channel):</span>
-                <span className="text-slate-500 text-[11px]">
-                  {telemetry.direction === 'infuse' ? 'Dispensing / Infusing' : 'Refilling / Idle'}
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                  (telemetry.direction === 'infuse' || telemetry.cyclePhase === 'infusing_A')
+                    ? 'bg-emerald-100 text-emerald-800 ring-1 ring-emerald-300'
+                    : 'bg-slate-200 text-slate-700'
+                }`}>
+                  {(telemetry.direction === 'infuse' || telemetry.cyclePhase === 'infusing_A') ? 'Dispensing / Infusing' : 'Refilling / Idle'}
                 </span>
               </div>
-              <span className="font-mono font-bold text-slate-700 text-xs">
-                Delivered: {telemetry.infusedVolume.toFixed(4)} {volUnit}
-              </span>
+              <div className="flex items-center gap-3 font-mono text-xs">
+                <span className="text-slate-500 text-[11px]">Fluid Remaining: <strong className="text-slate-800">{fluidPercentA.toFixed(1)}%</strong></span>
+                <span className="font-bold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                  Dispensed: {telemetry.infusedVolume.toFixed(4)} {volUnit}
+                </span>
+              </div>
             </div>
 
             {/* Syringe Barrel A Graphic */}
-            <div className="h-7 w-full bg-slate-200 rounded-lg overflow-hidden border border-slate-300 relative flex items-center">
+            <div className="h-8 w-full bg-slate-200 rounded-lg overflow-hidden border border-slate-300 relative flex items-center shadow-inner">
               {/* Fluid fill volume in Syringe A */}
               <div
-                className={`h-full transition-all duration-300 ${
-                  telemetry.direction === 'infuse' ? 'bg-emerald-500' : 'bg-emerald-400'
+                className={`h-full transition-all duration-150 ${
+                  (telemetry.direction === 'infuse' || telemetry.cyclePhase === 'infusing_A')
+                    ? 'bg-emerald-500'
+                    : 'bg-emerald-400/80'
                 }`}
                 style={{ width: `${fluidPercentA}%` }}
               />
               {/* Plunger Seal Graphic */}
               <div
-                className="absolute h-full w-3 bg-slate-800 border-r border-l border-slate-900 shadow-md transition-all duration-300"
+                className="absolute h-full w-3 bg-slate-800 border-r border-l border-slate-900 shadow-md transition-all duration-150"
                 style={{ left: `calc(${plungerPositionA}% - 6px)` }}
               />
-              <div className="absolute inset-0 flex items-center justify-between px-3 text-[10px] font-mono text-slate-700 pointer-events-none">
+              <div className="absolute inset-0 flex items-center justify-between px-3 text-[10px] font-mono font-bold text-slate-800 pointer-events-none drop-shadow-xs">
                 <span>0 {volUnit} (Empty)</span>
                 <span>Barrel Capacity ({telemetry.targetVolume || telemetry.strokeTarget || 5} {volUnit})</span>
               </div>
@@ -270,23 +362,23 @@ export const TopSection: React.FC = () => {
           </div>
 
           {/* Central Carriage & Directional Flow Indicator */}
-          <div className="my-2 py-1.5 px-3 rounded-lg bg-white border border-slate-200 flex items-center justify-between text-xs">
-            <div className="flex items-center gap-1.5">
-              <span className="text-slate-500">Motor Carriage Movement:</span>
-              {telemetry.direction === 'infuse' ? (
-                <span className="inline-flex items-center gap-1 text-emerald-700 font-bold font-mono">
-                  <ArrowRight className="w-4 h-4 animate-bounce" /> Moving Right (&rarr; Infuse A)
+          <div className="my-2 py-2 px-3 rounded-lg bg-white border border-slate-200 flex items-center justify-between text-xs shadow-2xs">
+            <div className="flex items-center gap-2">
+              <span className="text-slate-500 font-semibold">Motor Carriage Drive:</span>
+              {(telemetry.direction === 'infuse' || telemetry.cyclePhase === 'infusing_A') ? (
+                <span className="inline-flex items-center gap-1.5 text-emerald-700 font-bold font-mono bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                  <ArrowRight className="w-4 h-4 animate-pulse" /> Moving Forward (&rarr; Dispense Syringe A / Refill Syringe B)
                 </span>
-              ) : telemetry.direction === 'withdraw' ? (
-                <span className="inline-flex items-center gap-1 text-sky-700 font-bold font-mono">
-                  <ArrowLeft className="w-4 h-4 animate-bounce" /> Moving Left (&larr; Withdraw / Infuse B)
+              ) : (telemetry.direction === 'withdraw' || telemetry.cyclePhase === 'withdrawing_A') ? (
+                <span className="inline-flex items-center gap-1.5 text-sky-700 font-bold font-mono bg-sky-50 px-2 py-0.5 rounded border border-sky-200">
+                  <ArrowLeft className="w-4 h-4 animate-pulse" /> Moving Reverse (&larr; Dispense Syringe B / Refill Syringe A)
                 </span>
               ) : (
-                <span className="text-slate-500 font-mono">Stationary (Stopped)</span>
+                <span className="text-slate-500 font-mono font-medium">Stationary (Stopped)</span>
               )}
             </div>
 
-            <div className="text-[11px] text-slate-500">
+            <div className="text-[11px] font-mono text-slate-600">
               {telemetry.continuousActive
                 ? `Continuous Mode: Cycle #${telemetry.currentCycle}`
                 : `Single Stroke Mode`}
@@ -299,30 +391,39 @@ export const TopSection: React.FC = () => {
               <div className="flex items-center gap-2">
                 <span className="w-2.5 h-2.5 rounded-full bg-sky-500"></span>
                 <span className="font-semibold text-slate-900">Syringe B (Reverse Channel):</span>
-                <span className="text-slate-500 text-[11px]">
-                  {telemetry.direction === 'withdraw' ? 'Dispensing / Withdrawing' : 'Refilling / Idle'}
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                  (telemetry.direction === 'withdraw' || telemetry.cyclePhase === 'withdrawing_A')
+                    ? 'bg-sky-100 text-sky-800 ring-1 ring-sky-300'
+                    : 'bg-slate-200 text-slate-700'
+                }`}>
+                  {(telemetry.direction === 'withdraw' || telemetry.cyclePhase === 'withdrawing_A') ? 'Dispensing / Withdrawing' : 'Refilling / Idle'}
                 </span>
               </div>
-              <span className="font-mono font-bold text-slate-700 text-xs">
-                Withdrawn: {telemetry.withdrawnVolume.toFixed(4)} {volUnit}
-              </span>
+              <div className="flex items-center gap-3 font-mono text-xs">
+                <span className="text-slate-500 text-[11px]">Fluid Remaining: <strong className="text-slate-800">{fluidPercentB.toFixed(1)}%</strong></span>
+                <span className="font-bold text-sky-800 bg-sky-50 px-2 py-0.5 rounded border border-sky-200">
+                  Dispensed: {telemetry.withdrawnVolume.toFixed(4)} {volUnit}
+                </span>
+              </div>
             </div>
 
             {/* Syringe Barrel B Graphic */}
-            <div className="h-7 w-full bg-slate-200 rounded-lg overflow-hidden border border-slate-300 relative flex items-center">
+            <div className="h-8 w-full bg-slate-200 rounded-lg overflow-hidden border border-slate-300 relative flex items-center shadow-inner">
               {/* Fluid fill volume in Syringe B */}
               <div
-                className={`h-full transition-all duration-300 ${
-                  telemetry.direction === 'withdraw' ? 'bg-sky-500' : 'bg-sky-400'
+                className={`h-full transition-all duration-150 ${
+                  (telemetry.direction === 'withdraw' || telemetry.cyclePhase === 'withdrawing_A')
+                    ? 'bg-sky-500'
+                    : 'bg-sky-400/80'
                 }`}
                 style={{ width: `${fluidPercentB}%` }}
               />
               {/* Plunger Seal Graphic */}
               <div
-                className="absolute h-full w-3 bg-slate-800 border-r border-l border-slate-900 shadow-md transition-all duration-300"
+                className="absolute h-full w-3 bg-slate-800 border-r border-l border-slate-900 shadow-md transition-all duration-150"
                 style={{ left: `calc(${plungerPositionB}% - 6px)` }}
               />
-              <div className="absolute inset-0 flex items-center justify-between px-3 text-[10px] font-mono text-slate-700 pointer-events-none">
+              <div className="absolute inset-0 flex items-center justify-between px-3 text-[10px] font-mono font-bold text-slate-800 pointer-events-none drop-shadow-xs">
                 <span>0 {volUnit} (Empty)</span>
                 <span>Barrel Capacity ({telemetry.targetVolume || telemetry.strokeTarget || 5} {volUnit})</span>
               </div>

@@ -163,7 +163,23 @@ export const BottomSection: React.FC = () => {
 
   // Apply Syringe Diameter
   const handleApplyDiameter = async () => {
-    await pumpController.setParameters({ diameterMm });
+    const preset = selectedPresetIndex !== null ? SYRINGE_PRESETS[selectedPresetIndex] : null;
+    let sVol: number | undefined = undefined;
+    let sUnit: string = 'ml';
+    if (preset) {
+      if (preset.volumeUl >= 1000) {
+        sVol = preset.volumeUl / 1000;
+        sUnit = 'ml';
+      } else {
+        sVol = preset.volumeUl;
+        sUnit = 'ul';
+      }
+    }
+    await pumpController.setParameters({
+      diameterMm,
+      syringeVolume: sVol,
+      syringeVolumeUnit: sUnit
+    });
     setDiameterSaved(true);
     setTimeout(() => setDiameterSaved(false), 2000);
   };
@@ -171,8 +187,23 @@ export const BottomSection: React.FC = () => {
   // Apply Target Volume, Dual Flow Rates & Target Time
   const handleApplyTargets = async () => {
     const timeStr = targetTimeEnabled ? formatTimeStr(targetTimeHours, targetTimeMins, targetTimeSecs) : null;
+    const preset = selectedPresetIndex !== null ? SYRINGE_PRESETS[selectedPresetIndex] : null;
+    let sVol: number | undefined = undefined;
+    let sUnit: string = 'ml';
+    if (preset) {
+      if (preset.volumeUl >= 1000) {
+        sVol = preset.volumeUl / 1000;
+        sUnit = 'ml';
+      } else {
+        sVol = preset.volumeUl;
+        sUnit = 'ul';
+      }
+    }
+
     await pumpController.setParameters({
       diameterMm,
+      syringeVolume: sVol,
+      syringeVolumeUnit: sUnit,
       infuseRate,
       infuseRateUnit,
       withdrawRate,
