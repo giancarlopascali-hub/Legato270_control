@@ -72,27 +72,47 @@ export const TopSection: React.FC = () => {
   const infInUl = toMicroliters(telemetry.infusedVolume, telemetry.volumeUnit || telemetry.targetUnit || 'ml');
   const wthInUl = toMicroliters(telemetry.withdrawnVolume, telemetry.volumeUnit || telemetry.targetUnit || 'ml');
 
-  // Dynamic fill calculation for Syringe A and Syringe B
+  // Dynamic fill calculation for Syringe A and Syringe B based on active stroke progress
+  const strokeRatio = Math.min(1, Math.max(0, telemetry.strokePercent / 100));
   let fluidPercentA = 100;
-  let fluidPercentB = 0;
+  let fluidPercentB = 100;
 
   if (telemetry.continuousActive) {
     if (telemetry.cyclePhase === 'infusing_A' || telemetry.direction === 'infuse') {
-      const ratio = targetInUl > 0 ? Math.min(1, Math.max(0, infInUl / targetInUl)) : 0;
-      fluidPercentA = Math.max(0, Math.min(100, (1 - ratio) * 100)); // Syringe A dispensing (drains 100% -> 0%)
-      fluidPercentB = Math.max(0, Math.min(100, ratio * 100));       // Syringe B refilling (fills 0% -> 100%)
+      // Phase 1: Syringe A dispensing (100% -> 0%), Syringe B refilling (0% -> 100%)
+      fluidPercentA = Math.max(0, Math.min(100, (1 - strokeRatio) * 100));
+      fluidPercentB = Math.max(0, Math.min(100, strokeRatio * 100));
     } else {
-      const ratio = targetInUl > 0 ? Math.min(1, Math.max(0, wthInUl / targetInUl)) : 0;
-      fluidPercentB = Math.max(0, Math.min(100, (1 - ratio) * 100)); // Syringe B dispensing (drains 100% -> 0%)
-      fluidPercentA = Math.max(0, Math.min(100, ratio * 100));       // Syringe A refilling (fills 0% -> 100%)
+      // Phase 2: Syringe B dispensing (100% -> 0%), Syringe A refilling (0% -> 100%)
+      fluidPercentB = Math.max(0, Math.min(100, (1 - strokeRatio) * 100));
+      fluidPercentA = Math.max(0, Math.min(100, strokeRatio * 100));
     }
   } else {
-    // Single stroke mode
-    const deliveredRatioA = targetInUl > 0 ? Math.min(1, Math.max(0, infInUl / targetInUl)) : 0;
-    fluidPercentA = Math.max(0, Math.min(100, (1 - deliveredRatioA) * 100));
-    
-    const deliveredRatioB = targetInUl > 0 ? Math.min(1, Math.max(0, wthInUl / targetInUl)) : 0;
-    fluidPercentB = Math.max(0, Math.min(100, deliveredRatioB * 100));
+    // Single stroke mode:
+    if (telemetry.direction === 'withdraw') {
+      // Syringe B dispensing (100% -> 0%), Syringe A refilling (0% -> 100%)
+      fluidPercentB = Math.max(0, Math.min(100, (1 - strokeRatio) * 100));
+      fluidPercentA = Math.max(0, Math.min(100, strokeRatio * 100));
+    } else if (telemetry.direction === 'infuse') {
+      // Syringe A dispensing (100% -> 0%), Syringe B refilling (0% -> 100%)
+      fluidPercentA = Math.max(0, Math.min(100, (1 - strokeRatio) * 100));
+      fluidPercentB = Math.max(0, Math.min(100, strokeRatio * 100));
+    } else {
+      // Direction is idle: reflect completion or ready-to-run filled state
+      if (telemetry.prompt === 'T*' || telemetry.statusText === 'TARGET REACHED') {
+        if (telemetry.carriagePercent >= 90) {
+          fluidPercentA = 0;
+          fluidPercentB = 100;
+        } else {
+          fluidPercentB = 0;
+          fluidPercentA = 100;
+        }
+      } else {
+        // Ready state: both syringes primed and filled at 100%
+        fluidPercentA = 100;
+        fluidPercentB = 100;
+      }
+    }
   }
 
   const plungerPositionA = fluidPercentA;
@@ -330,10 +350,13 @@ export const TopSection: React.FC = () => {
                   {(telemetry.direction === 'infuse' || telemetry.cyclePhase === 'infusing_A') ? 'Dispensing / Infusing' : 'Refilling / Idle'}
                 </span>
               </div>
-              <div className="flex items-center gap-3 font-mono text-xs">
+              <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
                 <span className="text-slate-500 text-[11px]">Fluid Remaining: <strong className="text-slate-800">{fluidPercentA.toFixed(1)}%</strong></span>
                 <span className="font-bold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                  Dispensed: {telemetry.infusedVolume.toFixed(4)} {volUnit}
+                  Stroke: {(telemetry.direction === 'infuse' || telemetry.cyclePhase === 'infusing_A') ? (telemetry.currentStrokeVolume || 0).toFixed(4) : (fluidPercentA === 0 ? (telemetry.targetVolume || 5).toFixed(4) : '0.0000')} {volUnit}
+                </span>
+                <span className="text-slate-600 bg-slate-100 px-2 py-0.5 rounded border border-slate-200 text-[11px]">
+                  Total: {telemetry.infusedVolume.toFixed(4)} {volUnit}
                 </span>
               </div>
             </div>
@@ -399,10 +422,13 @@ export const TopSection: React.FC = () => {
                   {(telemetry.direction === 'withdraw' || telemetry.cyclePhase === 'withdrawing_A') ? 'Dispensing / Withdrawing' : 'Refilling / Idle'}
                 </span>
               </div>
-              <div className="flex items-center gap-3 font-mono text-xs">
+              <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
                 <span className="text-slate-500 text-[11px]">Fluid Remaining: <strong className="text-slate-800">{fluidPercentB.toFixed(1)}%</strong></span>
                 <span className="font-bold text-sky-800 bg-sky-50 px-2 py-0.5 rounded border border-sky-200">
-                  Dispensed: {telemetry.withdrawnVolume.toFixed(4)} {volUnit}
+                  Stroke: {(telemetry.direction === 'withdraw' || telemetry.cyclePhase === 'withdrawing_A') ? (telemetry.currentStrokeVolume || 0).toFixed(4) : (fluidPercentB === 0 ? (telemetry.targetVolume || 5).toFixed(4) : '0.0000')} {volUnit}
+                </span>
+                <span className="text-slate-600 bg-slate-100 px-2 py-0.5 rounded border border-slate-200 text-[11px]">
+                  Total: {telemetry.withdrawnVolume.toFixed(4)} {volUnit}
                 </span>
               </div>
             </div>

@@ -44,6 +44,7 @@ export interface PumpTelemetry {
   // Accumulated volumes
   infusedVolume: number;
   withdrawnVolume: number;
+  currentStrokeVolume: number; // Volume delivered in active stroke
   totalContinuousVolume: number; // Total fluid delivered across all cycles combined
   strokeElapsedSec: number;
   strokeDurationSec: number;
@@ -164,6 +165,9 @@ export class Legato270WebController {
   private runClockTimer: any = null;
   private programAbortController: AbortController | null = null;
   private commandQueue: Promise<void> = Promise.resolve();
+  private isTransitioningCycle = false;
+  private lastCycleTransitionTime = 0;
+  private currentStrokeVolume = 0;
 
   private telemetryListeners: TelemetryListener[] = [];
   private logListeners: LogListener[] = [];
@@ -196,6 +200,7 @@ export class Legato270WebController {
     targetTimeEnabled: false,
     infusedVolume: 0.0,
     withdrawnVolume: 0.0,
+    currentStrokeVolume: 0.0,
     totalContinuousVolume: 0.0,
     strokeElapsedSec: 0,
     strokeDurationSec: 120,
@@ -568,13 +573,14 @@ export class Legato270WebController {
         this.state.statusText = 'TARGET REACHED';
         this.state.statusCategory = 'Idle';
         this.state.prompt = 'T*';
+        this.state.direction = 'idle';
         this.state.isStalled = false;
-        if (this.state.continuousActive) {
+        this.stopRunClock();
+        if (this.state.continuousActive && !this.isTransitioningCycle) {
           this.handleContinuousTargetReached();
-        } else {
-          this.state.direction = 'idle';
-          this.stopRunClock();
         }
+        this.emitTelemetry();
+        return;
       } else {
         this.state.isStalled = true;
         this.state.stallMessage = line;
@@ -587,6 +593,45 @@ export class Legato270WebController {
         this.emitTelemetry();
         return;
       }
+    }
+
+    // 1.1 Direct text status keywords from hardware responses (e.g. "00:Target reached", "00:Stopped", "00:Infusing at...")
+    if (lineLower.includes('target reached') || lineLower.includes('target volume reached') || lineLower.includes('target time reached')) {
+      this.state.statusText = 'TARGET REACHED';
+      this.state.statusCategory = 'Idle';
+      this.state.direction = 'idle';
+      this.state.prompt = 'T*';
+      this.stopRunClock();
+      if (this.state.continuousActive && !this.isTransitioningCycle) {
+        this.handleContinuousTargetReached();
+      }
+      this.emitTelemetry();
+      return;
+    }
+
+    if (lineLower.includes('stopped') || (lineLower.includes('idle') && !lineLower.includes('infus') && !lineLower.includes('withdr'))) {
+      if (!this.state.continuousActive && this.state.direction !== 'idle') {
+        this.state.statusText = 'STOPPED';
+        this.state.statusCategory = 'Idle';
+        this.state.direction = 'idle';
+        this.state.prompt = ':';
+        this.stopRunClock();
+        this.emitTelemetry();
+      }
+    }
+
+    if (lineLower.includes('infusing at') || lineLower.startsWith('infusing')) {
+      this.state.statusText = 'INFUSING';
+      this.state.statusCategory = 'Running';
+      this.state.direction = 'infuse';
+      this.state.prompt = '>';
+      this.startRunClock();
+    } else if (lineLower.includes('withdrawing at') || lineLower.startsWith('withdrawing')) {
+      this.state.statusText = 'WITHDRAWING';
+      this.state.statusCategory = 'Running';
+      this.state.direction = 'withdraw';
+      this.state.prompt = '<';
+      this.startRunClock();
     }
 
     // 2. Parse pump model & version (e.g. "KD Scientific Legato 270 v2.1.0" or "00:KD Scientific Legato 270")
@@ -706,11 +751,6 @@ export class Legato270WebController {
     }
 
     this.emitTelemetry();
-
-    // 12. Continuous push/pull cycle transition check on prompt
-    if (this.state.continuousActive && (this.state.prompt === 'T*' || this.state.statusText === 'TARGET REACHED')) {
-      this.handleContinuousTargetReached();
-    }
   }
 
   private updateStatusFromPrompt(prompt: PumpStatusPrompt) {
@@ -719,16 +759,19 @@ export class Legato270WebController {
         this.state.statusText = 'STOPPED';
         this.state.statusCategory = 'Idle';
         this.state.direction = 'idle';
+        this.stopRunClock();
         break;
       case '>':
         this.state.statusText = 'INFUSING';
         this.state.statusCategory = 'Running';
         this.state.direction = 'infuse';
+        this.startRunClock();
         break;
       case '<':
         this.state.statusText = 'WITHDRAWING';
         this.state.statusCategory = 'Running';
         this.state.direction = 'withdraw';
+        this.startRunClock();
         break;
       case '*':
         // On KD Scientific / Harvard pumps, * prompt indicates motor paused or stalled before reaching target
@@ -741,6 +784,7 @@ export class Legato270WebController {
         this.state.statusText = 'TARGET REACHED';
         this.state.statusCategory = 'Idle';
         this.state.direction = 'idle';
+        this.stopRunClock();
         break;
       case '!':
         this.state.statusText = 'MOTOR STALLED / ALARM';
@@ -761,15 +805,17 @@ export class Legato270WebController {
   private startHardwarePolling() {
     this.stopHardwarePolling();
     this.pollTimer = setInterval(async () => {
-      if (this.state.isRealHardware && this.state.isConnected) {
-        await this.sendCommand('poll', false);
+      if (this.isTransitioningCycle) return;
+      if (this.state.isRealHardware && this.state.isConnected && this.port && this.port.writable) {
+        // Query status and prompt from hardware
+        await this.sendCommand('status', false);
         if (this.state.direction === 'infuse') {
           await this.sendCommand('ivolume', false);
         } else if (this.state.direction === 'withdraw') {
           await this.sendCommand('wvolume', false);
         }
       }
-    }, 750);
+    }, 450);
   }
 
   private stopHardwarePolling() {
@@ -857,10 +903,11 @@ export class Legato270WebController {
       this.state.prompt = ':';
       this.state.statusText = 'STOPPED';
       this.state.statusCategory = 'Idle';
-      this.state.continuousActive = false;
-      this.state.isProgramRunning = false;
+      if (!this.state.continuousActive && !this.isTransitioningCycle) {
+        this.state.isProgramRunning = false;
+        this.stopRunClock();
+      }
       rx = '00::';
-      this.stopRunClock();
     } else if (lower.startsWith('irate')) {
       const parts = lower.split(/\s+/);
       if (parts.length >= 3) {
@@ -981,7 +1028,9 @@ export class Legato270WebController {
         this.state.infusedVolume += dVol;
         this.state.totalContinuousVolume += dVol;
         this.state.strokeElapsedSec += dt;
-        strokeDelivered = this.state.infusedVolume;
+        this.currentStrokeVolume += dVol;
+        this.state.currentStrokeVolume = this.currentStrokeVolume;
+        strokeDelivered = this.currentStrokeVolume;
 
         // Carriage position for Infuse: moves 0% -> 100%
         const pct = targetVol > 0 ? (strokeDelivered / targetVol) * 100 : 50;
@@ -991,7 +1040,9 @@ export class Legato270WebController {
         // Check Target Volume Reached
         if (targetVol > 0 && strokeDelivered >= targetVol) {
           if (this.state.continuousActive) {
-            this.handleContinuousTargetReached();
+            if (!this.isTransitioningCycle) {
+              this.handleContinuousTargetReached();
+            }
             return;
           } else {
             this.state.direction = 'idle';
@@ -1010,7 +1061,9 @@ export class Legato270WebController {
         this.state.withdrawnVolume += dVol;
         this.state.totalContinuousVolume += dVol;
         this.state.strokeElapsedSec += dt;
-        strokeDelivered = this.state.withdrawnVolume;
+        this.currentStrokeVolume += dVol;
+        this.state.currentStrokeVolume = this.currentStrokeVolume;
+        strokeDelivered = this.currentStrokeVolume;
 
         // Carriage position for Withdraw: moves 100% -> 0%
         const pct = targetVol > 0 ? (strokeDelivered / targetVol) * 100 : 50;
@@ -1020,7 +1073,9 @@ export class Legato270WebController {
         // Check Target Volume Reached
         if (targetVol > 0 && strokeDelivered >= targetVol) {
           if (this.state.continuousActive) {
-            this.handleContinuousTargetReached();
+            if (!this.isTransitioningCycle) {
+              this.handleContinuousTargetReached();
+            }
             return;
           } else {
             this.state.direction = 'idle';
@@ -1082,6 +1137,14 @@ export class Legato270WebController {
     this.state.isStalled = false;
     this.state.stallMessage = '';
     this.state.continuousActive = false;
+
+    // Ready active stroke tracking without resetting cumulative ivolume/wvolume counters
+    this.currentStrokeVolume = 0;
+    this.state.currentStrokeVolume = 0;
+    this.state.strokeElapsedSec = 0;
+    this.state.strokePercent = 0;
+    this.state.carriagePercent = 0;
+
     this.startRunClock();
     this.emitTelemetry();
 
@@ -1100,10 +1163,18 @@ export class Legato270WebController {
     this.state.isStalled = false;
     this.state.stallMessage = '';
     this.state.continuousActive = false;
+
+    // Ready active stroke tracking without resetting cumulative ivolume/wvolume counters
+    this.currentStrokeVolume = 0;
+    this.state.currentStrokeVolume = 0;
+    this.state.strokeElapsedSec = 0;
+    this.state.strokePercent = 0;
+    this.state.carriagePercent = 100;
+
     this.startRunClock();
     this.emitTelemetry();
 
-    // CRITICAL: Ensure withdraw rate (wrate) is synchronized to hardware before wrun!
+    // Ensure withdraw rate (wrate) is synchronized to hardware before wrun
     const unit = normalizeSerialUnit(this.state.withdrawRateUnit || this.state.flowUnit || 'ml/min');
     const rate = this.state.withdrawRate || this.state.flowRate || 2.5;
     await this.sendCommand(`wrate ${rate} ${unit}`);
@@ -1132,6 +1203,8 @@ export class Legato270WebController {
     // 1. Immediately reset internal telemetry state so UI updates in 0ms
     this.state.infusedVolume = 0.0;
     this.state.withdrawnVolume = 0.0;
+    this.currentStrokeVolume = 0.0;
+    this.state.currentStrokeVolume = 0.0;
     this.state.totalContinuousVolume = 0.0;
     this.state.strokeElapsedSec = 0;
     this.state.strokePercent = 0;
@@ -1195,10 +1268,10 @@ export class Legato270WebController {
       this.state.volumeUnit = normalizeSerialUnit(params.volumeUnit);
     }
 
-    // Handle Infuse Rate
+    // Handle Infuse Rate - only send if explicitly provided
     const infRate = params.infuseRate ?? params.flowRate;
-    const infUnit = normalizeSerialUnit(params.infuseRateUnit ?? params.flowUnit ?? this.state.infuseRateUnit ?? 'ml/min');
     if (infRate !== undefined) {
+      const infUnit = normalizeSerialUnit(params.infuseRateUnit ?? params.flowUnit ?? this.state.infuseRateUnit ?? 'ml/min');
       this.state.infuseRate = infRate;
       this.state.infuseRateUnit = infUnit;
       this.state.flowRate = infRate;
@@ -1206,10 +1279,10 @@ export class Legato270WebController {
       await this.sendCommand(`irate ${infRate} ${infUnit}`);
     }
 
-    // Handle Withdraw Rate
-    const wthRate = params.withdrawRate ?? params.flowRate ?? this.state.withdrawRate;
-    const wthUnit = normalizeSerialUnit(params.withdrawRateUnit ?? params.flowUnit ?? this.state.withdrawRateUnit ?? 'ml/min');
+    // Handle Withdraw Rate - only send if explicitly provided (do not fall back to this.state.withdrawRate)
+    const wthRate = params.withdrawRate;
     if (wthRate !== undefined) {
+      const wthUnit = normalizeSerialUnit(params.withdrawRateUnit ?? params.flowUnit ?? this.state.withdrawRateUnit ?? 'ml/min');
       this.state.withdrawRate = wthRate;
       this.state.withdrawRateUnit = wthUnit;
       await this.sendCommand(`wrate ${wthRate} ${wthUnit}`);
@@ -1273,6 +1346,8 @@ export class Legato270WebController {
     const volUnit = normalizeSerialUnit(volumeUnit || this.state.volumeUnit || 'ml');
     const wRate = withdrawRate ?? flowRate;
 
+    this.isTransitioningCycle = false;
+    this.lastCycleTransitionTime = Date.now();
     this.state.continuousActive = true;
     this.state.currentCycle = 1;
     this.state.totalCycles = totalCycles;
@@ -1293,9 +1368,12 @@ export class Legato270WebController {
     this.state.prompt = '>';
     this.state.statusText = 'CONTINUOUS: FORWARD STROKE (INFUSE A / REFILL B)';
     this.state.statusCategory = 'Running';
-    this.state.infusedVolume = 0;
-    this.state.withdrawnVolume = 0;
+    this.currentStrokeVolume = 0;
+    this.state.currentStrokeVolume = 0;
+    this.state.totalContinuousVolume = 0;
     this.state.strokeElapsedSec = 0;
+    this.state.strokePercent = 0;
+    this.state.carriagePercent = 0;
     this.startRunClock();
 
     this.emitLog(
@@ -1306,11 +1384,10 @@ export class Legato270WebController {
     await this.sendCommand('stop');
     // Clear any hardware timer target to ensure continuous cycles run without unexpected time stops
     await this.sendCommand('cttime');
-    await this.sendCommand(`diameter ${this.state.diameterMm}`);
+    // Do NOT send diameter here to prevent hardware from resetting configured flow rates
     await this.sendCommand(`irate ${flowRate} ${infUnit}`);
     await this.sendCommand(`wrate ${wRate} ${wthUnit}`);
     await this.sendCommand(`tvolume ${strokeVolume} ${volUnit}`);
-    await this.sendCommand('cvolume');
 
     this.emitTelemetry();
     this.emitLog('cycle', `Cycle #1 - Phase 1: Forward Stroke (Infuse A / Refill B)`);
@@ -1319,42 +1396,87 @@ export class Legato270WebController {
 
   private async handleContinuousTargetReached() {
     if (!this.state.continuousActive) return;
+    if (this.isTransitioningCycle) return;
 
-    if (this.state.cyclePhase === 'infusing_A') {
-      this.state.cyclePhase = 'withdrawing_A';
-      this.state.direction = 'withdraw';
-      this.state.prompt = '<';
-      this.state.statusText = 'CONTINUOUS: REVERSE STROKE (INFUSE B / REFILL A)';
-      this.state.statusCategory = 'Running';
-      this.state.withdrawnVolume = 0;
-      this.state.strokeElapsedSec = 0;
-      this.emitTelemetry();
-      this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 2: Reverse Stroke (Infuse B / Refill A)`);
-      await this.sendCommand('stop');
-      await this.sendCommand('cvolume');
-      await this.sendCommand('wrun');
-    } else if (this.state.cyclePhase === 'withdrawing_A') {
-      this.emitLog('cycle', `Completed Cycle #${this.state.currentCycle} bidirectional push/pull delivery.`);
+    const now = Date.now();
+    if (now - this.lastCycleTransitionTime < 1500) {
+      return;
+    }
 
-      if (this.state.totalCycles > 0 && this.state.currentCycle >= this.state.totalCycles) {
-        this.emitLog('cycle', `[+] Completed target ${this.state.totalCycles} continuous cycles. Halting.`);
-        this.stop();
-        return;
+    this.isTransitioningCycle = true;
+    this.lastCycleTransitionTime = now;
+
+    try {
+      if (this.state.cyclePhase === 'infusing_A') {
+        this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Forward stroke complete. Switching to reverse stroke...`);
+        this.state.cyclePhase = 'withdrawing_A';
+        this.state.direction = 'withdraw';
+        this.state.prompt = '<';
+        this.state.statusText = 'CONTINUOUS: REVERSE STROKE (INFUSE B / REFILL A)';
+        this.state.statusCategory = 'Running';
+        this.currentStrokeVolume = 0;
+        this.state.currentStrokeVolume = 0;
+        this.state.strokeElapsedSec = 0;
+        this.state.strokePercent = 0;
+        this.state.carriagePercent = 100;
+        this.emitTelemetry();
+
+        await this.sendCommand('stop');
+        await this.sendCommand('cttime');
+
+        // Allow mechanical settle between stroke reversals
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        if (!this.state.continuousActive) return;
+
+        // Synchronize withdraw rate before reverse run
+        const wRate = this.state.withdrawRate || this.state.flowRate || 2.5;
+        const wthUnit = normalizeSerialUnit(this.state.withdrawRateUnit || this.state.flowUnit || 'ml/min');
+        await this.sendCommand(`wrate ${wRate} ${wthUnit}`);
+        await this.sendCommand('wrun');
+        this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 2: Reverse Stroke active.`);
+      } else if (this.state.cyclePhase === 'withdrawing_A') {
+        this.emitLog('cycle', `Completed Cycle #${this.state.currentCycle} bidirectional push/pull delivery.`);
+
+        if (this.state.totalCycles > 0 && this.state.currentCycle >= this.state.totalCycles) {
+          this.emitLog('cycle', `[+] Completed target ${this.state.totalCycles} continuous cycles. Halting.`);
+          await this.stop();
+          return;
+        }
+
+        this.state.currentCycle += 1;
+        this.state.cyclePhase = 'infusing_A';
+        this.state.direction = 'infuse';
+        this.state.prompt = '>';
+        this.state.statusText = 'CONTINUOUS: FORWARD STROKE (INFUSE A / REFILL B)';
+        this.state.statusCategory = 'Running';
+        this.currentStrokeVolume = 0;
+        this.state.currentStrokeVolume = 0;
+        this.state.strokeElapsedSec = 0;
+        this.state.strokePercent = 0;
+        this.state.carriagePercent = 0;
+        this.emitTelemetry();
+
+        await this.sendCommand('stop');
+        await this.sendCommand('cttime');
+
+        // Allow mechanical settle between stroke reversals
+        await new Promise((resolve) => setTimeout(resolve, 200));
+
+        if (!this.state.continuousActive) return;
+
+        // Synchronize infuse rate before forward run
+        const infRate = this.state.infuseRate || this.state.flowRate || 2.5;
+        const infUnit = normalizeSerialUnit(this.state.infuseRateUnit || this.state.flowUnit || 'ml/min');
+        await this.sendCommand(`irate ${infRate} ${infUnit}`);
+        await this.sendCommand('irun');
+        this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 1: Forward Stroke active.`);
       }
-
-      this.state.currentCycle += 1;
-      this.state.cyclePhase = 'infusing_A';
-      this.state.direction = 'infuse';
-      this.state.prompt = '>';
-      this.state.statusText = 'CONTINUOUS: FORWARD STROKE (INFUSE A / REFILL B)';
-      this.state.statusCategory = 'Running';
-      this.state.infusedVolume = 0;
-      this.state.strokeElapsedSec = 0;
-      this.emitTelemetry();
-      this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 1: Forward Stroke (Infuse A / Refill B)`);
-      await this.sendCommand('stop');
-      await this.sendCommand('cvolume');
-      await this.sendCommand('irun');
+    } finally {
+      // Release lock after a brief debounce period so trailing hardware telemetry does not falsely re-trigger
+      setTimeout(() => {
+        this.isTransitioningCycle = false;
+      }, 1000);
     }
   }
 

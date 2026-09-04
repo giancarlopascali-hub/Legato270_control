@@ -161,49 +161,20 @@ export const BottomSection: React.FC = () => {
     }
   };
 
-  // Apply Syringe Diameter
+  // Apply Syringe Diameter - sends ONLY diameterMm so the pump does not reset rates or complain
   const handleApplyDiameter = async () => {
-    const preset = selectedPresetIndex !== null ? SYRINGE_PRESETS[selectedPresetIndex] : null;
-    let sVol: number | undefined = undefined;
-    let sUnit: string = 'ml';
-    if (preset) {
-      if (preset.volumeUl >= 1000) {
-        sVol = preset.volumeUl / 1000;
-        sUnit = 'ml';
-      } else {
-        sVol = preset.volumeUl;
-        sUnit = 'ul';
-      }
-    }
     await pumpController.setParameters({
-      diameterMm,
-      syringeVolume: sVol,
-      syringeVolumeUnit: sUnit
+      diameterMm
     });
     setDiameterSaved(true);
     setTimeout(() => setDiameterSaved(false), 2000);
   };
 
-  // Apply Target Volume, Dual Flow Rates & Target Time
+  // Apply Target Volume, Dual Flow Rates & Target Time - sends ONLY flow rates and targets, leaving diameter untouched
   const handleApplyTargets = async () => {
     const timeStr = targetTimeEnabled ? formatTimeStr(targetTimeHours, targetTimeMins, targetTimeSecs) : null;
-    const preset = selectedPresetIndex !== null ? SYRINGE_PRESETS[selectedPresetIndex] : null;
-    let sVol: number | undefined = undefined;
-    let sUnit: string = 'ml';
-    if (preset) {
-      if (preset.volumeUl >= 1000) {
-        sVol = preset.volumeUl / 1000;
-        sUnit = 'ml';
-      } else {
-        sVol = preset.volumeUl;
-        sUnit = 'ul';
-      }
-    }
 
     await pumpController.setParameters({
-      diameterMm,
-      syringeVolume: sVol,
-      syringeVolumeUnit: sUnit,
       infuseRate,
       infuseRateUnit,
       withdrawRate,
