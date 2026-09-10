@@ -16,7 +16,9 @@ import {
   Activity,
   RotateCcw,
   AlertTriangle,
-  Timer
+  Timer,
+  TrendingUp,
+  Zap
 } from 'lucide-react';
 
 export const TopSection: React.FC = () => {
@@ -456,6 +458,289 @@ export const TopSection: React.FC = () => {
             </div>
           </div>
 
+        </div>
+      </div>
+
+      {/* 2.1 Dynamic Continuous Cycle Flow & Push/Pull Waveform Graph */}
+      <div id="dynamic-cycle-flow-graph" className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+          <div className="flex items-center gap-2">
+            <TrendingUp className="w-4 h-4 text-indigo-600" />
+            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800">
+              Dynamic Continuous Cycle Flow Graph (Push / Pull Waveform)
+            </h2>
+          </div>
+          <div className="flex items-center gap-2">
+            {telemetry.continuousActive ? (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 font-mono text-xs font-bold animate-pulse">
+                <Zap className="w-3.5 h-3.5 fill-indigo-600 text-indigo-600" />
+                <span>Active Cycle #{telemetry.currentCycle} {telemetry.totalCycles > 0 ? `/ ${telemetry.totalCycles}` : '(Infinite Continuous)'}</span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-slate-100 border border-slate-200 text-slate-600 font-mono text-xs font-semibold">
+                <span>Cycle Profile Ready</span>
+              </span>
+            )}
+            <span className="text-[11px] font-mono text-slate-500 bg-slate-50 px-2 py-0.5 rounded border border-slate-200">
+              {telemetry.isRealHardware ? 'Hardware Synchronized' : 'High-Precision Simulation'}
+            </span>
+          </div>
+        </div>
+
+        {/* Dynamic Waveform SVG Canvas */}
+        <div className="bg-slate-900 rounded-xl p-3 sm:p-4 border border-slate-800 relative overflow-hidden">
+          {/* Legend and Axis labels */}
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono mb-2 pb-2 border-b border-slate-800/80">
+            <div className="flex items-center gap-4">
+              <span className="flex items-center gap-1.5 text-emerald-400 font-semibold">
+                <span className="w-2.5 h-2.5 rounded-xs bg-emerald-500"></span>
+                <span>+Q Forward Stroke (Infuse A / Refill B): {telemetry.infuseRate || telemetry.flowRate} {infRateUnit}</span>
+              </span>
+              <span className="flex items-center gap-1.5 text-sky-400 font-semibold">
+                <span className="w-2.5 h-2.5 rounded-xs bg-sky-500"></span>
+                <span>-Q Reverse Stroke (Infuse B / Refill A): {telemetry.withdrawRate || telemetry.flowRate} {wthRateUnit}</span>
+              </span>
+            </div>
+            <div className="text-slate-400 text-[11px]">
+              Stroke Target: <strong className="text-white">{telemetry.targetVolume || telemetry.strokeTarget || 5} {volUnit}</strong>
+            </div>
+          </div>
+
+          {/* SVG Multi-Cycle Dynamic Timeline */}
+          <div className="w-full overflow-x-auto">
+            <svg
+              viewBox="0 0 800 160"
+              className="w-full h-36 min-w-[600px] select-none"
+              preserveAspectRatio="none"
+            >
+              <defs>
+                <linearGradient id="emeraldPulseGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                  <stop offset="0%" stopColor="#10b981" stopOpacity="0.85" />
+                  <stop offset="100%" stopColor="#059669" stopOpacity="0.25" />
+                </linearGradient>
+                <linearGradient id="skyPulseGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                  <stop offset="0%" stopColor="#0284c7" stopOpacity="0.25" />
+                  <stop offset="100%" stopColor="#0369a1" stopOpacity="0.85" />
+                </linearGradient>
+                <linearGradient id="activeCursorGlow" x1="0%" y1="0%" x2="0%" y2="100%">
+                  <stop offset="0%" stopColor="#fbbf24" stopOpacity="0.9" />
+                  <stop offset="100%" stopColor="#f59e0b" stopOpacity="0.2" />
+                </linearGradient>
+              </defs>
+
+              {/* Gridlines */}
+              <line x1="40" y1="20" x2="780" y2="20" stroke="#334155" strokeDasharray="3 3" strokeWidth="0.8" />
+              <line x1="40" y1="80" x2="780" y2="80" stroke="#64748b" strokeWidth="1.5" />
+              <line x1="40" y1="140" x2="780" y2="140" stroke="#334155" strokeDasharray="3 3" strokeWidth="0.8" />
+
+              {/* Y-Axis Labels */}
+              <text x="35" y="24" textAnchor="end" fill="#10b981" fontSize="10" fontFamily="monospace" fontWeight="bold">+Q</text>
+              <text x="35" y="83" textAnchor="end" fill="#94a3b8" fontSize="10" fontFamily="monospace">0</text>
+              <text x="35" y="144" textAnchor="end" fill="#38bdf8" fontSize="10" fontFamily="monospace" fontWeight="bold">-Q</text>
+
+              {/* Render 4 Sequential Continuous Cycles (Cycle 1, Cycle 2, Cycle 3, Cycle 4) */}
+              {[1, 2, 3, 4].map((cycleNum, idx) => {
+                const cycleStartX = 50 + idx * 180;
+                const phaseWidth = 85;
+                const isCurrentCycle = telemetry.continuousActive ? telemetry.currentCycle === cycleNum : idx === 0;
+                const isPastCycle = telemetry.continuousActive && telemetry.currentCycle > cycleNum;
+                const isFutureCycle = telemetry.continuousActive && telemetry.currentCycle < cycleNum;
+
+                // Active phase within current cycle
+                const isPhase1Active = isCurrentCycle && (telemetry.cyclePhase === 'infusing_A' || telemetry.direction === 'infuse');
+                const isPhase2Active = isCurrentCycle && (telemetry.cyclePhase === 'withdrawing_A' || telemetry.direction === 'withdraw');
+
+                // Dynamic fill width for the current live pulse
+                const liveProgressRatio = Math.min(1, Math.max(0, telemetry.strokePercent / 100));
+                const currentPhase1Fill = isPhase1Active
+                  ? phaseWidth * liveProgressRatio
+                  : (isPastCycle || (isCurrentCycle && isPhase2Active) ? phaseWidth : 0);
+
+                const currentPhase2Fill = isPhase2Active
+                  ? phaseWidth * liveProgressRatio
+                  : (isPastCycle ? phaseWidth : 0);
+
+                return (
+                  <g key={cycleNum}>
+                    {/* Cycle Header Marker */}
+                    <text
+                      x={cycleStartX + phaseWidth}
+                      y="14"
+                      textAnchor="middle"
+                      fill={isCurrentCycle ? '#e0e7ff' : '#64748b'}
+                      fontSize="10"
+                      fontFamily="monospace"
+                      fontWeight={isCurrentCycle ? 'bold' : 'normal'}
+                    >
+                      Cycle #{cycleNum} {isCurrentCycle ? '(Live)' : ''}
+                    </text>
+
+                    {/* Phase 1 Background Outline (Infuse A) */}
+                    <rect
+                      x={cycleStartX}
+                      y="20"
+                      width={phaseWidth}
+                      height="60"
+                      fill="#064e3b"
+                      fillOpacity="0.25"
+                      stroke="#059669"
+                      strokeWidth={isCurrentCycle && isPhase1Active ? '1.5' : '1'}
+                      strokeDasharray={isFutureCycle ? '3 3' : undefined}
+                      rx="2"
+                    />
+
+                    {/* Phase 1 Dynamic Fluid Fill (+Q) */}
+                    {currentPhase1Fill > 0 && (
+                      <rect
+                        x={cycleStartX}
+                        y="20"
+                        width={currentPhase1Fill}
+                        height="60"
+                        fill="url(#emeraldPulseGrad)"
+                        rx="2"
+                      />
+                    )}
+
+                    <text
+                      x={cycleStartX + phaseWidth / 2}
+                      y="53"
+                      textAnchor="middle"
+                      fill={isCurrentCycle && isPhase1Active ? '#a7f3d0' : '#6ee7b7'}
+                      fontSize="9"
+                      fontFamily="monospace"
+                      fontWeight="bold"
+                    >
+                      Infuse A
+                    </text>
+
+                    {/* Phase 2 Background Outline (Withdraw B) */}
+                    <rect
+                      x={cycleStartX + phaseWidth + 5}
+                      y="80"
+                      width={phaseWidth}
+                      height="60"
+                      fill="#082f49"
+                      fillOpacity="0.25"
+                      stroke="#0284c7"
+                      strokeWidth={isCurrentCycle && isPhase2Active ? '1.5' : '1'}
+                      strokeDasharray={isFutureCycle ? '3 3' : undefined}
+                      rx="2"
+                    />
+
+                    {/* Phase 2 Dynamic Fluid Fill (-Q) */}
+                    {currentPhase2Fill > 0 && (
+                      <rect
+                        x={cycleStartX + phaseWidth + 5}
+                        y="80"
+                        width={currentPhase2Fill}
+                        height="60"
+                        fill="url(#skyPulseGrad)"
+                        rx="2"
+                      />
+                    )}
+
+                    <text
+                      x={cycleStartX + phaseWidth + 5 + phaseWidth / 2}
+                      y="114"
+                      textAnchor="middle"
+                      fill={isCurrentCycle && isPhase2Active ? '#bae6fd' : '#7dd3fc'}
+                      fontSize="9"
+                      fontFamily="monospace"
+                      fontWeight="bold"
+                    >
+                      Infuse B (Refill A)
+                    </text>
+
+                    {/* Live Scanning Cursor for Current Cycle */}
+                    {isCurrentCycle && isPhase1Active && (
+                      <g>
+                        <line
+                          x1={cycleStartX + currentPhase1Fill}
+                          y1="16"
+                          x2={cycleStartX + currentPhase1Fill}
+                          y2="84"
+                          stroke="#fbbf24"
+                          strokeWidth="2"
+                          strokeDasharray="2 2"
+                        />
+                        <circle
+                          cx={cycleStartX + currentPhase1Fill}
+                          cy="20"
+                          r="4"
+                          fill="#fbbf24"
+                          className="animate-ping"
+                        />
+                        <circle
+                          cx={cycleStartX + currentPhase1Fill}
+                          cy="20"
+                          r="3"
+                          fill="#f59e0b"
+                        />
+                      </g>
+                    )}
+
+                    {isCurrentCycle && isPhase2Active && (
+                      <g>
+                        <line
+                          x1={cycleStartX + phaseWidth + 5 + currentPhase2Fill}
+                          y1="76"
+                          x2={cycleStartX + phaseWidth + 5 + currentPhase2Fill}
+                          y2="144"
+                          stroke="#fbbf24"
+                          strokeWidth="2"
+                          strokeDasharray="2 2"
+                        />
+                        <circle
+                          cx={cycleStartX + phaseWidth + 5 + currentPhase2Fill}
+                          cy="140"
+                          r="4"
+                          fill="#fbbf24"
+                          className="animate-ping"
+                        />
+                        <circle
+                          cx={cycleStartX + phaseWidth + 5 + currentPhase2Fill}
+                          cy="140"
+                          r="3"
+                          fill="#f59e0b"
+                        />
+                      </g>
+                    )}
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+
+          {/* Bottom Telemetry Strip */}
+          <div className="mt-3 pt-2.5 border-t border-slate-800 grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+            <div className="bg-slate-800/60 rounded-lg p-2 border border-slate-700/60">
+              <span className="text-[10px] uppercase text-slate-400 block">Current Cycle Stroke</span>
+              <strong className="text-white font-bold">
+                {(telemetry.currentStrokeVolume || 0).toFixed(4)} / {(telemetry.targetVolume || telemetry.strokeTarget || 5).toFixed(4)} {volUnit}
+              </strong>
+            </div>
+
+            <div className="bg-slate-800/60 rounded-lg p-2 border border-slate-700/60">
+              <span className="text-[10px] uppercase text-slate-400 block">Stroke Completion</span>
+              <strong className="text-amber-300 font-bold">
+                {telemetry.strokePercent.toFixed(1)}%
+              </strong>
+            </div>
+
+            <div className="bg-slate-800/60 rounded-lg p-2 border border-slate-700/60">
+              <span className="text-[10px] uppercase text-slate-400 block">Continuous Total Delivered</span>
+              <strong className="text-emerald-300 font-bold">
+                {telemetry.totalContinuousVolume.toFixed(4)} {volUnit}
+              </strong>
+            </div>
+
+            <div className="bg-slate-800/60 rounded-lg p-2 border border-slate-700/60">
+              <span className="text-[10px] uppercase text-slate-400 block">Active Phase Direction</span>
+              <strong className={telemetry.direction === 'infuse' ? 'text-emerald-400 font-bold' : telemetry.direction === 'withdraw' ? 'text-sky-400 font-bold' : 'text-slate-300 font-bold'}>
+                {telemetry.direction === 'infuse' ? 'Forward (Infuse A)' : telemetry.direction === 'withdraw' ? 'Reverse (Infuse B)' : 'Stationary'}
+              </strong>
+            </div>
+          </div>
         </div>
       </div>
 

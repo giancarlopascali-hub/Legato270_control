@@ -30,6 +30,8 @@ export const BottomSection: React.FC = () => {
   // 1. Syringe Dimensions State
   const [selectedPresetIndex, setSelectedPresetIndex] = useState<number>(3); // Default to BD Plastic 10ml
   const [diameterMm, setDiameterMm] = useState<number>(14.50);
+  const [syringeVolume, setSyringeVolume] = useState<number>(10.0);
+  const [syringeVolumeUnit, setSyringeVolumeUnit] = useState<string>('ml');
   const [diameterSaved, setDiameterSaved] = useState<boolean>(false);
 
   // 2. Flow Rates & Target Volume State
@@ -123,6 +125,12 @@ export const BottomSection: React.FC = () => {
     if (t.diameterMm && t.diameterMm > 0) {
       setDiameterMm(t.diameterMm);
     }
+    if (t.syringeVolume && t.syringeVolume > 0) {
+      setSyringeVolume(t.syringeVolume);
+    }
+    if (t.syringeVolumeUnit) {
+      setSyringeVolumeUnit(t.syringeVolumeUnit);
+    }
     if (t.infuseRate && t.infuseRate > 0) {
       setInfuseRate(t.infuseRate);
     }
@@ -158,13 +166,22 @@ export const BottomSection: React.FC = () => {
     const preset = SYRINGE_PRESETS[idx];
     if (preset) {
       setDiameterMm(preset.diameterMm);
+      if (preset.volumeUl >= 1000) {
+        setSyringeVolume(preset.volumeUl / 1000);
+        setSyringeVolumeUnit('ml');
+      } else {
+        setSyringeVolume(preset.volumeUl);
+        setSyringeVolumeUnit('ul');
+      }
     }
   };
 
-  // Apply Syringe Diameter - sends ONLY diameterMm so the pump does not reset rates or complain
+  // Apply Syringe Specs - sends both diameter and syringe volume capacity to pump
   const handleApplyDiameter = async () => {
     await pumpController.setParameters({
-      diameterMm
+      diameterMm,
+      syringeVolume,
+      syringeVolumeUnit
     });
     setDiameterSaved(true);
     setTimeout(() => setDiameterSaved(false), 2000);
@@ -361,8 +378,41 @@ export const BottomSection: React.FC = () => {
                     mm
                   </span>
                 </div>
+              </div>
+
+              {/* Syringe Nominal Capacity / Volume */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-semibold text-slate-700">
+                    Syringe Volume Capacity:
+                  </label>
+                  <span className="text-[11px] font-mono text-blue-700 font-semibold">
+                    Current: {telemetry.syringeVolume || 10} {telemetry.syringeVolumeUnit || 'ml'}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    id="syringe-volume-input"
+                    type="number"
+                    step="0.1"
+                    min="0.001"
+                    value={syringeVolume}
+                    onChange={(e) => setSyringeVolume(parseFloat(e.target.value) || 0)}
+                    className="flex-1 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <select
+                    id="syringe-volume-unit-select"
+                    value={syringeVolumeUnit}
+                    onChange={(e) => setSyringeVolumeUnit(e.target.value)}
+                    className="w-24 px-2 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="ml">ml</option>
+                    <option value="ul">µl</option>
+                    <option value="nl">nl</option>
+                  </select>
+                </div>
                 <p className="text-[11px] text-slate-500 mt-1">
-                  Sends standard <code className="font-mono text-blue-700 bg-blue-50 px-1 rounded">diameter &lt;val&gt;</code> ASCII command.
+                  Sends <code className="font-mono text-blue-700 bg-blue-50 px-1 rounded">diameter &lt;val&gt;</code> and <code className="font-mono text-blue-700 bg-blue-50 px-1 rounded">svolume &lt;val&gt; &lt;unit&gt;</code> to update pump specs & display.
                 </p>
               </div>
 
@@ -378,12 +428,12 @@ export const BottomSection: React.FC = () => {
               {diameterSaved ? (
                 <>
                   <Check className="w-3.5 h-3.5 text-emerald-600" />
-                  <span className="text-emerald-700">Diameter Applied to Pump!</span>
+                  <span className="text-emerald-700">Syringe Specs Applied to Pump!</span>
                 </>
               ) : (
                 <>
                   <Send className="w-3.5 h-3.5 text-slate-600" />
-                  <span>Send Diameter to Pump</span>
+                  <span>Send Syringe Specs to Pump</span>
                 </>
               )}
             </button>
