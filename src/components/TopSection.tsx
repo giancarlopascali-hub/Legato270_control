@@ -62,7 +62,7 @@ export const TopSection: React.FC = () => {
     await pumpController.resetCounters();
   };
 
-  const volUnit = formatDisplayUnit(telemetry.volumeUnit || telemetry.targetUnit || 'ml');
+  const volUnit = formatDisplayUnit(telemetry.targetUnit || telemetry.volumeUnit || 'ml');
   const infRateUnit = formatDisplayUnit(telemetry.infuseRateUnit || telemetry.flowUnit || 'ml/min');
   const wthRateUnit = formatDisplayUnit(telemetry.withdrawRateUnit || telemetry.flowUnit || 'ml/min');
 
@@ -71,8 +71,8 @@ export const TopSection: React.FC = () => {
     ? toMicroliters(telemetry.targetVolume, telemetry.targetUnit || telemetry.volumeUnit || 'ml')
     : toMicroliters(telemetry.strokeTarget && telemetry.strokeTarget > 0 ? telemetry.strokeTarget : 10.0, telemetry.targetUnit || 'ml');
 
-  const infInUl = toMicroliters(telemetry.infusedVolume, telemetry.volumeUnit || telemetry.targetUnit || 'ml');
-  const wthInUl = toMicroliters(telemetry.withdrawnVolume, telemetry.volumeUnit || telemetry.targetUnit || 'ml');
+  const infInUl = toMicroliters(telemetry.infusedVolume, telemetry.targetUnit || telemetry.volumeUnit || 'ml');
+  const wthInUl = toMicroliters(telemetry.withdrawnVolume, telemetry.targetUnit || telemetry.volumeUnit || 'ml');
 
   // Dynamic fill calculation for Syringe A and Syringe B based on active stroke progress
   const strokeRatio = Math.min(1, Math.max(0, telemetry.strokePercent / 100));
