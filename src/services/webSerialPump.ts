@@ -549,43 +549,33 @@ export class Legato270WebController {
     // Example: "166666666666 242088000 627786130920 i..TI." or "00: 166666666666 242088000 627786130920 i..TI."
     const statusTelemetryMatch = line.trim().match(/^(?:(\d{1,2}):\s*)?(\d+)\s+(\d+)\s+(\d+)\s+([a-zA-Z\.]{4,8})$/);
     if (statusTelemetryMatch) {
+      const rawRate = parseFloat(statusTelemetryMatch[2]);
+      const rawTime = parseFloat(statusTelemetryMatch[3]);
       const rawVol = parseFloat(statusTelemetryMatch[4]);
       const flags = statusTelemetryMatch[5]; // e.g. "i..TI." or "I....." or "w..TW."
 
       const targetVol = this.state.targetVolume && this.state.targetVolume > 0
         ? this.state.targetVolume
-        : (this.state.strokeTarget && this.state.strokeTarget > 0 ? this.state.strokeTarget : 2.0);
+        : (this.state.strokeTarget && this.state.strokeTarget > 0 ? this.state.strokeTarget : 2.5);
       const targetUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
-      const targetVolInMl = convertVolume(targetVol, targetUnit, 'ml');
-      const targetVolInPl = targetVolInMl * 1e9;
-      const targetVolInFl = targetVolInMl * 1e12;
 
-      // Harvard Apparatus / KD Scientific status field 4 volume unit detection:
-      // KD Scientific Legato pumps typically report volume in picoliters (1e9 pL = 1 mL).
-      // Harvard PHD Ultra pumps report in femtoliters (1e12 fL = 1 mL).
-      // If rawVol is closer to pL scale than fL scale (or rawVol < 5e11), it is in picoliters (divide by 1e9).
-      // Otherwise, it is in femtoliters (divide by 1e12).
-      let volumeMl = 0;
-      if (rawVol > 0) {
-        if (targetVolInMl > 0) {
-          const distToPl = Math.abs(rawVol - targetVolInPl);
-          const distToFl = Math.abs(rawVol - targetVolInFl);
-          if (distToPl < distToFl || rawVol < 5e11) {
-            volumeMl = rawVol / 1e9;
-          } else {
-            volumeMl = rawVol / 1e12;
-          }
-        } else {
-          volumeMl = rawVol < 5e11 ? rawVol / 1e9 : rawVol / 1e12;
-        }
-      }
-
+      // Harvard Apparatus / KD Scientific Legato status field 4 reports volume delivered in femtoliters (1e12 fL = 1 mL, 1e9 fL = 1 µL):
+      const volumeMl = rawVol / 1e12;
       const volInTargetUnit = convertVolume(volumeMl, 'ml', targetUnit);
 
-      const flagMotor = flags.charAt(0); // 'I' (infusing), 'i' (infuse stopped/idle), 'W' (withdrawing), 'w' (withdraw stopped/idle), 's' (stopped), 't' (paused at target)
+      // Flag 1 (index 0): Motor status - 'I' = infusing, 'i' = infuse idle, 'W' = withdrawing, 'w' = withdraw idle, 's' = stopped, 't' = target pause
+      const flagMotor = flags.charAt(0);
+      // Flag 2 (index 1): Limit switch
       const flagLimit = flags.charAt(1);
-      const flagStall = flags.charAt(2); // 'S', '*', '.'
-      const flagTarget = flags.includes('T') || flagMotor === 't';
+      // Flag 3 (index 2): Stall - 'S', '*', '.'
+      const flagStall = flags.charAt(2);
+      // Flag 4 (index 3): Trigger input pin state (TTL) - 'T' = high, '.' = low (DO NOT use for target reached!)
+      const flagTrigger = flags.charAt(3);
+      // Flag 5 (index 4): Direction port state
+      const flagDirPort = flags.charAt(4);
+      // Flag 6 (index 5): Target volume reached - 'T' = reached, '.' = not reached
+      const flagTarget = (flags.length >= 6 && flags.charAt(5) === 'T') || flagMotor === 't';
+      const isMotorRunning = flagMotor === 'I' || flagMotor === 'W';
 
       // Check stall / alarm flags
       if (flagStall === 'S' || flagStall === '*' || flags.includes('*') || flags.includes('!')) {
@@ -605,43 +595,54 @@ export class Legato270WebController {
       const pct = targetVol > 0 ? (volInTargetUnit / targetVol) * 100 : 0;
       const clampedPct = Math.min(100, Math.max(0, Math.round(pct * 10) / 10));
 
-      // Motor active updates
+      // Active motor updates from hardware status
       if (flagMotor === 'I') {
         this.state.direction = 'infuse';
-        this.state.statusText = 'INFUSING';
+        this.state.statusText = this.state.continuousActive
+          ? `CONTINUOUS: FORWARD STROKE (Cycle #${this.state.currentCycle})`
+          : (this.state.isProgramRunning ? `PROGRAM: INFUSING (Step ${this.state.currentProgramStep}/${this.state.totalProgramSteps})` : 'INFUSING');
         this.state.statusCategory = 'Running';
         this.state.prompt = '>';
         if (volInTargetUnit > this.currentStrokeVolume || this.currentStrokeVolume === 0) {
           this.currentStrokeVolume = volInTargetUnit;
         }
         this.state.currentStrokeVolume = this.currentStrokeVolume;
-        this.state.infusedVolume = this.currentStrokeVolume;
+        if (this.state.continuousActive) {
+          this.state.infusedVolume = (this.state.currentCycle - 1) * targetVol + this.currentStrokeVolume;
+          this.state.totalContinuousVolume = (this.state.currentCycle - 1) * 2 * targetVol + this.currentStrokeVolume;
+        } else {
+          this.state.infusedVolume = this.currentStrokeVolume;
+        }
         this.state.volumeUnit = targetUnit;
         this.state.strokePercent = clampedPct;
         this.state.carriagePercent = clampedPct;
         this.startRunClock();
       } else if (flagMotor === 'W') {
         this.state.direction = 'withdraw';
-        this.state.statusText = 'WITHDRAWING';
+        this.state.statusText = this.state.continuousActive
+          ? `CONTINUOUS: REVERSE STROKE (Cycle #${this.state.currentCycle})`
+          : (this.state.isProgramRunning ? `PROGRAM: WITHDRAWING (Step ${this.state.currentProgramStep}/${this.state.totalProgramSteps})` : 'WITHDRAWING');
         this.state.statusCategory = 'Running';
         this.state.prompt = '<';
         if (volInTargetUnit > this.currentStrokeVolume || this.currentStrokeVolume === 0) {
           this.currentStrokeVolume = volInTargetUnit;
         }
         this.state.currentStrokeVolume = this.currentStrokeVolume;
-        this.state.withdrawnVolume = this.currentStrokeVolume;
+        if (this.state.continuousActive) {
+          this.state.withdrawnVolume = (this.state.currentCycle - 1) * targetVol + this.currentStrokeVolume;
+          this.state.totalContinuousVolume = (this.state.currentCycle - 1) * 2 * targetVol + targetVol + this.currentStrokeVolume;
+        } else {
+          this.state.withdrawnVolume = this.currentStrokeVolume;
+        }
         this.state.volumeUnit = targetUnit;
         this.state.strokePercent = clampedPct;
         this.state.carriagePercent = Math.max(0, Math.min(100, 100 - clampedPct));
         this.startRunClock();
       }
 
-      // Check target volume reached
-      const isNearTarget = targetVol > 0 && volInTargetUnit >= targetVol * 0.98;
-      if (
-        flagTarget ||
-        (isNearTarget && ((flagMotor === 'i' || flagMotor === 'w') || this.state.statusCategory === 'Running'))
-      ) {
+      // Check target reached: Only declared when the motor is no longer running in forward/reverse
+      // AND either flag 6 indicates 'T' or hardware volume has reached the target
+      if (!isMotorRunning && (flagTarget || (targetVol > 0 && volInTargetUnit >= targetVol * 0.995))) {
         this.state.statusText = 'TARGET REACHED';
         this.state.statusCategory = 'Idle';
         this.state.prompt = 'T*';
@@ -705,6 +706,12 @@ export class Legato270WebController {
         this.state.prompt = 'T*';
         this.state.direction = 'idle';
         this.state.isStalled = false;
+        this.state.strokePercent = 100;
+        if (this.state.cyclePhase === 'infusing_A') {
+          this.state.carriagePercent = 100;
+        } else if (this.state.cyclePhase === 'withdrawing_A') {
+          this.state.carriagePercent = 0;
+        }
         this.stopRunClock();
         if (this.state.continuousActive && !this.isTransitioningCycle) {
           this.handleContinuousTargetReached();
@@ -856,60 +863,65 @@ export class Legato270WebController {
       }
     }
 
-    // 9. Parse infused volume hardware register response (e.g. "ivolume 0.5000 ml", "00: 0.5000 ml")
-    if (
-      this.state.lastCommand === 'ivolume' ||
-      lineLower.includes('ivol')
-    ) {
-      const match = line.match(/([\d.]+)\s*(ml|ul|µl|μl|nl)/i);
-      if (match) {
-        const hwVol = parseFloat(match[1]);
-        const hwUnit = normalizeSerialUnit(match[2]);
+    // 9. Parse volume responses (e.g. "ivolume 0.5000 ml", "00: 0.5000 ml", "273.2 ul", "0 ml")
+    const isRateLine = lineLower.includes('/') || lineLower.includes('rate');
+    const isTvolLine = lineLower.includes('tvol');
+    const isStatusTelemetry = !!statusTelemetryMatch;
+
+    if (!isRateLine && !isTvolLine && !isStatusTelemetry) {
+      const volMatch = line.trim().match(/^(?:(?:\d{1,2}:)?\s*(?:(?:ivol|wvol|svol)(?:ume)?)?\s*)?([\d.]+)\s*(ml|ul|µl|μl|nl)$/i);
+      if (volMatch) {
+        const hwVol = parseFloat(volMatch[1]);
+        const hwUnit = normalizeSerialUnit(volMatch[2]);
         const targetUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
         const normalizedVol = convertVolume(hwVol, hwUnit, targetUnit);
-        this.state.volumeUnit = targetUnit;
-        this.state.infusedVolume = normalizedVol;
 
-        if (this.state.direction === 'infuse' || this.state.cyclePhase === 'infusing_A') {
-          if (normalizedVol > this.currentStrokeVolume || this.currentStrokeVolume === 0) {
-            this.currentStrokeVolume = normalizedVol;
+        const isInfuseVol =
+          this.state.lastCommand === 'ivolume' ||
+          lineLower.includes('ivol') ||
+          ((this.state.direction === 'infuse' || this.state.cyclePhase === 'infusing_A') && this.state.lastCommand !== 'wvolume');
+
+        const isWithdrawVol =
+          this.state.lastCommand === 'wvolume' ||
+          lineLower.includes('wvol') ||
+          ((this.state.direction === 'withdraw' || this.state.cyclePhase === 'withdrawing_A') && this.state.lastCommand !== 'ivolume');
+
+        const targetVol = this.state.targetVolume && this.state.targetVolume > 0
+          ? this.state.targetVolume
+          : (this.state.strokeTarget && this.state.strokeTarget > 0 ? this.state.strokeTarget : 2.5);
+
+        if (isInfuseVol) {
+          this.state.volumeUnit = targetUnit;
+          this.currentStrokeVolume = normalizedVol;
+          this.state.currentStrokeVolume = normalizedVol;
+
+          if (this.state.continuousActive) {
+            this.state.infusedVolume = (this.state.currentCycle - 1) * targetVol + normalizedVol;
+            this.state.totalContinuousVolume = (this.state.currentCycle - 1) * 2 * targetVol + normalizedVol;
+          } else {
+            this.state.infusedVolume = normalizedVol;
           }
-          this.state.currentStrokeVolume = this.currentStrokeVolume;
-          const targetVol = this.state.targetVolume && this.state.targetVolume > 0
-            ? this.state.targetVolume
-            : (this.state.strokeTarget && this.state.strokeTarget > 0 ? this.state.strokeTarget : 2.0);
-          const pct = targetVol > 0 ? (this.currentStrokeVolume / targetVol) * 100 : 0;
+
+          const pct = targetVol > 0 ? (normalizedVol / targetVol) * 100 : 0;
           this.state.strokePercent = Math.min(100, Math.max(0, Math.round(pct * 10) / 10));
           this.state.carriagePercent = this.state.strokePercent;
-        }
-      }
-    }
+          this.emitTelemetry();
+        } else if (isWithdrawVol) {
+          this.state.volumeUnit = targetUnit;
+          this.currentStrokeVolume = normalizedVol;
+          this.state.currentStrokeVolume = normalizedVol;
 
-    // 10. Parse withdrawn volume hardware register response (e.g. "wvolume 0.5000 ml", "00: 0.5000 ml")
-    if (
-      this.state.lastCommand === 'wvolume' ||
-      lineLower.includes('wvol')
-    ) {
-      const match = line.match(/([\d.]+)\s*(ml|ul|µl|μl|nl)/i);
-      if (match) {
-        const hwVol = parseFloat(match[1]);
-        const hwUnit = normalizeSerialUnit(match[2]);
-        const targetUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
-        const normalizedVol = convertVolume(hwVol, hwUnit, targetUnit);
-        this.state.volumeUnit = targetUnit;
-        this.state.withdrawnVolume = normalizedVol;
-
-        if (this.state.direction === 'withdraw' || this.state.cyclePhase === 'withdrawing_A') {
-          if (normalizedVol > this.currentStrokeVolume || this.currentStrokeVolume === 0) {
-            this.currentStrokeVolume = normalizedVol;
+          if (this.state.continuousActive) {
+            this.state.withdrawnVolume = (this.state.currentCycle - 1) * targetVol + normalizedVol;
+            this.state.totalContinuousVolume = (this.state.currentCycle - 1) * 2 * targetVol + targetVol + normalizedVol;
+          } else {
+            this.state.withdrawnVolume = normalizedVol;
           }
-          this.state.currentStrokeVolume = this.currentStrokeVolume;
-          const targetVol = this.state.targetVolume && this.state.targetVolume > 0
-            ? this.state.targetVolume
-            : (this.state.strokeTarget && this.state.strokeTarget > 0 ? this.state.strokeTarget : 2.0);
-          const pct = targetVol > 0 ? (this.currentStrokeVolume / targetVol) * 100 : 0;
+
+          const pct = targetVol > 0 ? (normalizedVol / targetVol) * 100 : 0;
           this.state.strokePercent = Math.min(100, Math.max(0, Math.round(pct * 10) / 10));
           this.state.carriagePercent = Math.max(0, Math.min(100, 100 - this.state.strokePercent));
+          this.emitTelemetry();
         }
       }
     }
@@ -988,9 +1000,9 @@ export class Legato270WebController {
       if (this.state.isRealHardware && this.state.isConnected && this.port && this.port.writable) {
         // Query status and prompt from hardware
         await this.sendCommand('status', false);
-        if (this.state.direction === 'infuse') {
+        if (this.state.direction === 'infuse' || this.state.cyclePhase === 'infusing_A') {
           await this.sendCommand('ivolume', false);
-        } else if (this.state.direction === 'withdraw') {
+        } else if (this.state.direction === 'withdraw' || this.state.cyclePhase === 'withdrawing_A') {
           await this.sendCommand('wvolume', false);
         }
       }
@@ -1232,12 +1244,41 @@ export class Legato270WebController {
       // Single stroke target volume
       const targetVol = this.state.targetVolume && this.state.targetVolume > 0
         ? this.state.targetVolume
-        : (this.state.strokeTarget && this.state.strokeTarget > 0 ? this.state.strokeTarget : 2.0);
+        : (this.state.strokeTarget && this.state.strokeTarget > 0 ? this.state.strokeTarget : 2.5);
 
       // Expected total duration of a single stroke in seconds
       const rateInTargetUnitPerSec = convertVolume(ratePerSec, rateVolUnit, targetUnit);
       if (rateInTargetUnitPerSec > 0 && targetVol > 0) {
         this.state.strokeDurationSec = Math.max(1, Math.round(targetVol / rateInTargetUnitPerSec));
+      }
+
+      // If connected to real hardware, provide smooth UI interpolation between 450ms hardware polls.
+      // Capped at 99.5% of targetVol so the physical pump hardware controller remains 100% authoritative for stroke completion.
+      if (this.state.isRealHardware) {
+        const maxSimVol = targetVol > 0 ? targetVol * 0.995 : 999999;
+        if (this.currentStrokeVolume < maxSimVol) {
+          this.currentStrokeVolume = Math.min(maxSimVol, this.currentStrokeVolume + dVol);
+          this.state.currentStrokeVolume = this.currentStrokeVolume;
+          this.state.strokeElapsedSec += dt;
+
+          if (isInfusing) {
+            this.state.infusedVolume += dVol;
+            if (this.state.continuousActive) {
+              this.state.totalContinuousVolume += dVol;
+            }
+          } else {
+            this.state.withdrawnVolume += dVol;
+            if (this.state.continuousActive) {
+              this.state.totalContinuousVolume += dVol;
+            }
+          }
+
+          const pct = targetVol > 0 ? (this.currentStrokeVolume / targetVol) * 100 : 50;
+          this.state.strokePercent = Math.min(99.5, Math.max(0, Math.round(pct * 10) / 10));
+          this.state.carriagePercent = isInfusing ? this.state.strokePercent : Math.max(0, Math.min(100, 100 - this.state.strokePercent));
+          this.emitTelemetry();
+        }
+        return;
       }
 
       let strokeDelivered = 0;
@@ -1376,6 +1417,11 @@ export class Legato270WebController {
     const unit = normalizeSerialUnit(this.state.infuseRateUnit || this.state.flowUnit || 'ml/min');
     const rate = this.state.infuseRate || this.state.flowRate || 2.5;
     await this.sendCommand(`irate ${rate} ${unit}`);
+    if (this.state.targetVolume && this.state.targetVolume > 0) {
+      const volUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
+      await this.sendCommand(`tvolume ${this.state.targetVolume} ${volUnit}`);
+      await this.sendCommand('civolume');
+    }
     await this.sendCommand('irun');
   }
 
@@ -1402,6 +1448,11 @@ export class Legato270WebController {
     const unit = normalizeSerialUnit(this.state.withdrawRateUnit || this.state.flowUnit || 'ml/min');
     const rate = this.state.withdrawRate || this.state.flowRate || 2.5;
     await this.sendCommand(`wrate ${rate} ${unit}`);
+    if (this.state.targetVolume && this.state.targetVolume > 0) {
+      const volUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
+      await this.sendCommand(`tvolume ${this.state.targetVolume} ${volUnit}`);
+      await this.sendCommand('cwvolume');
+    }
     await this.sendCommand('wrun');
   }
 
@@ -1626,6 +1677,9 @@ export class Legato270WebController {
     await this.sendCommand('stop');
     // Clear any hardware timer target to ensure continuous cycles run without unexpected time stops
     await this.sendCommand('cttime');
+    await this.sendCommand('cvolume');
+    await this.sendCommand('civolume');
+    await this.sendCommand('cwvolume');
 
     // Ensure diameter and svolume are loaded into pump hardware BEFORE rates and tvolume:
     if (this.state.diameterMm && this.state.diameterMm > 0) {
@@ -1649,7 +1703,7 @@ export class Legato270WebController {
     if (this.isTransitioningCycle) return;
 
     const now = Date.now();
-    if (now - this.lastCycleTransitionTime < 300) {
+    if (now - this.lastCycleTransitionTime < 1500) {
       return;
     }
 
@@ -1679,9 +1733,10 @@ export class Legato270WebController {
 
         await this.sendCommand('stop');
         await this.sendCommand('cttime');
+        await this.sendCommand('cwvolume');
 
         // Allow mechanical settle between stroke reversals
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await new Promise((resolve) => setTimeout(resolve, 250));
 
         if (!this.state.continuousActive) return;
 
@@ -1719,9 +1774,10 @@ export class Legato270WebController {
 
         await this.sendCommand('stop');
         await this.sendCommand('cttime');
+        await this.sendCommand('civolume');
 
         // Allow mechanical settle between stroke reversals
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await new Promise((resolve) => setTimeout(resolve, 250));
 
         if (!this.state.continuousActive) return;
 
@@ -1734,10 +1790,10 @@ export class Legato270WebController {
         this.emitLog('cycle', `Cycle #${this.state.currentCycle} - Phase 1: Forward Stroke active.`);
       }
     } finally {
-      // Release lock after a brief debounce period so trailing hardware telemetry does not falsely re-trigger
+      // Release lock after a debounce period so trailing hardware telemetry does not falsely re-trigger
       setTimeout(() => {
         this.isTransitioningCycle = false;
-      }, 500);
+      }, 1000);
     }
   }
 
@@ -1766,25 +1822,82 @@ export class Legato270WebController {
         this.emitLog('info', `Program Step ${i + 1}/${steps.length}: ${step.type.toUpperCase()}`);
 
         if (step.type === 'infuse') {
+          this.state.direction = 'infuse';
+          this.state.prompt = '>';
+          this.state.statusCategory = 'Running';
+          this.state.statusText = `PROGRAM: INFUSING (Step ${i + 1}/${steps.length})`;
+          this.state.targetVolume = step.volume;
+          this.state.targetUnit = normalizeSerialUnit(step.volumeUnit);
+          this.state.infuseRate = step.rate;
+          this.state.infuseRateUnit = normalizeSerialUnit(step.rateUnit);
+          this.currentStrokeVolume = 0;
+          this.state.currentStrokeVolume = 0;
+          this.state.strokeElapsedSec = 0;
+          this.state.strokePercent = 0;
+          this.state.carriagePercent = 0;
+          this.startRunClock();
+          this.emitTelemetry();
+
           await this.sendCommand(`irate ${step.rate} ${step.rateUnit}`);
           await this.sendCommand(`tvolume ${step.volume} ${step.volumeUnit}`);
           await this.sendCommand('cvolume');
+          await this.sendCommand('civolume');
           await this.sendCommand('irun');
           await this.waitForTargetOrSignal(signal);
         } else if (step.type === 'withdraw') {
+          this.state.direction = 'withdraw';
+          this.state.prompt = '<';
+          this.state.statusCategory = 'Running';
+          this.state.statusText = `PROGRAM: WITHDRAWING (Step ${i + 1}/${steps.length})`;
+          this.state.targetVolume = step.volume;
+          this.state.targetUnit = normalizeSerialUnit(step.volumeUnit);
+          this.state.withdrawRate = step.rate;
+          this.state.withdrawRateUnit = normalizeSerialUnit(step.rateUnit);
+          this.currentStrokeVolume = 0;
+          this.state.currentStrokeVolume = 0;
+          this.state.strokeElapsedSec = 0;
+          this.state.strokePercent = 0;
+          this.state.carriagePercent = 100;
+          this.startRunClock();
+          this.emitTelemetry();
+
           await this.sendCommand(`wrate ${step.rate} ${step.rateUnit}`);
           await this.sendCommand(`tvolume ${step.volume} ${step.volumeUnit}`);
           await this.sendCommand('cvolume');
+          await this.sendCommand('cwvolume');
           await this.sendCommand('wrun');
           await this.waitForTargetOrSignal(signal);
         } else if (step.type === 'pause') {
           await this.sendCommand('stop');
+          this.state.direction = 'idle';
+          this.state.prompt = ':';
+          this.state.statusCategory = 'Idle';
+          this.state.statusText = `PROGRAM: PAUSED (${step.durationSec || 5}s)`;
+          this.stopRunClock();
+          this.emitTelemetry();
           const delaySec = step.durationSec || 5;
           this.emitLog('info', `Pausing program for ${delaySec} seconds...`);
           await new Promise((resolve) => setTimeout(resolve, delaySec * 1000));
         } else if (step.type === 'ramp') {
+          this.state.direction = 'infuse';
+          this.state.prompt = '>';
+          this.state.statusCategory = 'Running';
+          this.state.statusText = `PROGRAM: RAMP (Step ${i + 1}/${steps.length})`;
+          this.state.targetVolume = step.volume;
+          this.state.targetUnit = normalizeSerialUnit(step.volumeUnit);
+          this.state.infuseRate = step.rate;
+          this.state.infuseRateUnit = normalizeSerialUnit(step.rateUnit);
+          this.currentStrokeVolume = 0;
+          this.state.currentStrokeVolume = 0;
+          this.state.strokeElapsedSec = 0;
+          this.state.strokePercent = 0;
+          this.startRunClock();
+          this.emitTelemetry();
+
           await this.sendCommand(`irate ${step.rate} ${step.rateUnit}`);
           await this.sendCommand(`tvolume ${step.volume} ${step.volumeUnit}`);
+          await this.sendCommand('cvolume');
+          await this.sendCommand('civolume');
           await this.sendCommand('irun');
           await this.waitForTargetOrSignal(signal);
         }
@@ -1801,16 +1914,33 @@ export class Legato270WebController {
   }
 
   private waitForTargetOrSignal(signal: AbortSignal): Promise<void> {
+    const startTime = Date.now();
     return new Promise((resolve, reject) => {
       const check = setInterval(() => {
-        if (signal.aborted) {
+        if (signal.aborted || !this.state.isProgramRunning) {
           clearInterval(check);
-          reject(new Error('Aborted'));
-        } else if (this.state.prompt === 'T*' || this.state.direction === 'idle') {
-          clearInterval(check);
-          resolve();
+          reject(new Error('Program aborted by user'));
+          return;
         }
-      }, 200);
+        if (this.state.isStalled) {
+          clearInterval(check);
+          reject(new Error('Pump motor stall or limit switch alarm detected'));
+          return;
+        }
+
+        const elapsed = Date.now() - startTime;
+        // Wait at least 800ms before checking completion so motor startup latency doesn't prematurely resolve
+        if (elapsed > 800) {
+          if (
+            this.state.prompt === 'T*' ||
+            this.state.statusText === 'TARGET REACHED' ||
+            (this.state.direction === 'idle' && this.state.statusCategory === 'Idle')
+          ) {
+            clearInterval(check);
+            resolve();
+          }
+        }
+      }, 150);
     });
   }
 }
