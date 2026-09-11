@@ -461,7 +461,8 @@ export const TopSection: React.FC = () => {
         </div>
       </div>
 
-      {/* 2.1 Dynamic Continuous Cycle Flow & Push/Pull Waveform Graph */}
+      {/* 2.1 Dynamic Continuous Cycle Flow & Push/Pull Waveform Graph - visible only during continuous push/pull */}
+      {telemetry.continuousActive && (
       <div id="dynamic-cycle-flow-graph" className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
           <div className="flex items-center gap-2">
@@ -743,6 +744,7 @@ export const TopSection: React.FC = () => {
           </div>
         </div>
       </div>
+      )}
 
       {/* 3. Summary of System Parameters */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs">
