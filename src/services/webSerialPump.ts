@@ -142,6 +142,17 @@ export function parseTimeToSeconds(timeStr: string | null | undefined): number {
   return 0;
 }
 
+/**
+ * Formats total seconds into hh:mm:ss
+ */
+export function formatSecondsToHms(totalSecs: number): string {
+  const s = Math.max(0, Math.floor(totalSecs));
+  const hrs = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const secs = s % 60;
+  return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
 export function isHardwarePromptOrNoise(str: string): boolean {
   if (!str) return true;
   const trimmed = str.trim();
@@ -190,6 +201,10 @@ export class Legato270WebController {
   private currentStrokeVolume = 0;
   private infusedVolumeBaseline = 0;
   private withdrawnVolumeBaseline = 0;
+  private savedTargetVolume: number | null = 5.0;
+  private savedTargetUnit: string = 'ml';
+  private isTimedRunActive = false;
+  private runStartTime = 0;
 
   private telemetryListeners: TelemetryListener[] = [];
   private logListeners: LogListener[] = [];
@@ -605,15 +620,22 @@ export class Legato270WebController {
         return;
       }
 
-      const isTargetTime = !this.state.continuousActive && this.state.targetTimeEnabled && !!this.state.targetTime;
+      const isTargetTime = !this.state.continuousActive && (this.isTimedRunActive || (this.state.targetTimeEnabled && !!this.state.targetTime));
       const targetSecs = isTargetTime ? parseTimeToSeconds(this.state.targetTime) : 0;
-      const elapsedSecs = rawTime > 0 ? rawTime / 1000 : this.state.strokeElapsedSec;
+      
+      // Calculate stroke elapsed time accurately without relying on pump raw uptime clock (which can be huge)
+      let elapsedSecs = this.state.strokeElapsedSec;
+      if (isTargetTime && targetSecs > 0) {
+        if (this.runStartTime > 0) {
+          elapsedSecs = Math.min(targetSecs, (Date.now() - this.runStartTime) / 1000);
+        }
+        this.state.strokeElapsedSec = elapsedSecs;
+        this.state.strokeDurationSec = targetSecs;
+      }
 
       // Calculate stroke completion percentage (0% -> 100%)
       let clampedPct = 0;
       if (isTargetTime && targetSecs > 0) {
-        this.state.strokeDurationSec = targetSecs;
-        this.state.strokeElapsedSec = elapsedSecs;
         const timePct = (elapsedSecs / targetSecs) * 100;
         clampedPct = Math.min(100, Math.max(0, Math.round(timePct * 10) / 10));
       } else {
@@ -666,34 +688,41 @@ export class Legato270WebController {
         this.startRunClock();
       }
 
-      // Check target reached: Only declared when the motor is physically no longer turning ('i', 'w', 's', 't')
+      // Check target reached: Only declared when the motor was actively running and has now stopped ('i', 'w', 's', 't')
+      // OR target reached flag is set by hardware
       let isTargetFinished = false;
-      if (!isMotorRunning) {
+      const wasRunning = this.state.direction === 'infuse' || this.state.direction === 'withdraw' || this.state.statusCategory === 'Running';
+      if (!isMotorRunning && wasRunning) {
         if (isTargetTime && targetSecs > 0) {
-          isTargetFinished = flagTarget || elapsedSecs >= targetSecs;
+          isTargetFinished = flagTarget || elapsedSecs >= targetSecs * 0.95;
         } else {
           isTargetFinished = flagTarget || (targetVol > 0 && volInTargetUnit >= targetVol * 0.995);
         }
+      } else if (flagTarget && wasRunning) {
+        isTargetFinished = true;
       }
 
       if (isTargetFinished) {
         this.state.statusText = 'TARGET REACHED';
         this.state.statusCategory = 'Idle';
         this.state.prompt = 'T*';
+        const finishedDir = this.state.direction;
         this.state.direction = 'idle';
         this.state.isStalled = false;
         this.state.strokePercent = 100;
         this.infusedVolumeBaseline = this.state.infusedVolume;
         this.withdrawnVolumeBaseline = this.state.withdrawnVolume;
-        if (this.state.cyclePhase === 'infusing_A') {
+        if (this.state.cyclePhase === 'infusing_A' || finishedDir === 'infuse') {
           this.state.carriagePercent = 100;
-        } else if (this.state.cyclePhase === 'withdrawing_A') {
+        } else if (this.state.cyclePhase === 'withdrawing_A' || finishedDir === 'withdraw') {
           this.state.carriagePercent = 0;
         }
         this.stopRunClock();
 
         if (this.state.continuousActive && !this.isTransitioningCycle) {
           this.handleContinuousTargetReached();
+        } else if (isTargetTime || this.isTimedRunActive) {
+          this.reinstateOriginalStatus();
         }
         this.emitTelemetry();
         return;
@@ -887,15 +916,33 @@ export class Legato270WebController {
         this.state.targetVolume = val;
         this.state.strokeTarget = val;
         this.state.targetUnit = normalizeSerialUnit(match[2]);
+        if (val > 0) {
+          this.savedTargetVolume = val;
+          this.savedTargetUnit = this.state.targetUnit;
+        }
       }
     }
 
-    // 8. Parse target time (e.g. "00:05:00" or "0:5:0")
+    // 8. Parse target time (e.g. "00:05:00", "0:5:0", or "Target time not set")
     if (this.state.lastCommand?.toLowerCase().startsWith('ttime') || lineLower.includes('ttime')) {
-      const timeMatch = line.match(/(\d{1,2}:\d{2}:\d{2})/);
-      if (timeMatch) {
-        this.state.targetTime = timeMatch[1];
-        this.state.targetTimeEnabled = true;
+      if (lineLower.includes('not set') || lineLower.includes('disabled') || line.trim().endsWith('::') || line.trim() === '::') {
+        this.state.targetTime = null;
+        this.state.targetTimeEnabled = false;
+      } else {
+        const timeMatch = line.match(/(\d{1,2}:\d{2}:\d{2})/);
+        if (timeMatch) {
+          this.state.targetTime = timeMatch[1];
+          this.state.targetTimeEnabled = true;
+        } else {
+          const secsMatch = line.match(/(\d+)\s*sec/i);
+          if (secsMatch) {
+            const s = parseInt(secsMatch[1], 10);
+            if (s > 0) {
+              this.state.targetTime = formatSecondsToHms(s);
+              this.state.targetTimeEnabled = true;
+            }
+          }
+        }
       }
     }
 
@@ -1169,17 +1216,28 @@ export class Legato270WebController {
     } else if (lower.startsWith('tvolume')) {
       const parts = lower.split(/\s+/);
       if (parts.length >= 2) {
-        this.state.targetVolume = parseFloat(parts[1]) || null;
+        const val = parseFloat(parts[1]) || null;
+        this.state.targetVolume = val;
         this.state.strokeTarget = this.state.targetVolume;
         if (parts.length >= 3) {
           this.state.targetUnit = normalizeSerialUnit(parts[2]);
+        }
+        if (val && val > 0) {
+          this.savedTargetVolume = val;
+          this.savedTargetUnit = this.state.targetUnit;
         }
       }
       rx = `00:${this.state.targetVolume || 0} ${this.state.targetUnit}\n00:${this.state.prompt}`;
     } else if (lower.startsWith('ttime')) {
       const parts = lower.split(/\s+/);
       if (parts.length >= 2) {
-        this.state.targetTime = parts[1];
+        const timeVal = parts[1];
+        if (timeVal.includes(':')) {
+          this.state.targetTime = timeVal;
+        } else {
+          const s = parseInt(timeVal, 10) || 0;
+          this.state.targetTime = formatSecondsToHms(s);
+        }
         this.state.targetTimeEnabled = true;
       }
       rx = `00:${this.state.targetTime || '00:00:00'}\n00:${this.state.prompt}`;
@@ -1286,12 +1344,13 @@ export class Legato270WebController {
       const dVol = convertVolume(dVolInRateUnit, rateVolUnit, targetUnit);
 
       // Check if target time mode is active (for single infuse/withdraw only, not continuous)
-      const isTargetTime = !this.state.continuousActive && this.state.targetTimeEnabled && !!this.state.targetTime;
+      const isTargetTime = !this.state.continuousActive && (this.isTimedRunActive || (this.state.targetTimeEnabled && !!this.state.targetTime));
       const targetSecs = isTargetTime ? parseTimeToSeconds(this.state.targetTime) : 0;
 
       if (isTargetTime && targetSecs > 0) {
         this.state.strokeDurationSec = targetSecs;
-        this.state.strokeElapsedSec += dt;
+        const nowSecs = this.runStartTime > 0 ? (Date.now() - this.runStartTime) / 1000 : this.state.strokeElapsedSec + dt;
+        this.state.strokeElapsedSec = Math.min(targetSecs, nowSecs);
 
         const timePct = Math.min(100, Math.max(0, (this.state.strokeElapsedSec / targetSecs) * 100));
         const clampedPct = Math.round(timePct * 10) / 10;
@@ -1313,10 +1372,12 @@ export class Legato270WebController {
           this.state.statusText = 'TARGET REACHED';
           this.state.statusCategory = 'Idle';
           this.state.strokePercent = 100;
+          this.state.carriagePercent = isInfusing ? 100 : 0;
           this.stopRunClock();
           this.infusedVolumeBaseline = this.state.infusedVolume;
           this.withdrawnVolumeBaseline = this.state.withdrawnVolume;
-          this.emitLog('info', `Target time reached (${this.state.targetTime}).`);
+          this.emitLog('info', `Target time reached (${this.state.targetTime}). Reinstating original pump status...`);
+          this.reinstateOriginalStatus();
         }
 
         this.emitTelemetry();
@@ -1518,14 +1579,24 @@ export class Legato270WebController {
     await this.sendCommand(`irate ${rate} ${unit}`);
 
     if (this.state.targetTimeEnabled && this.state.targetTime) {
-      // Single Timed Infusion: Clear target volume so pump runs strictly for the configured duration
-      await this.sendCommand('ctvolume');
-      await this.sendCommand(`ttime ${this.state.targetTime}`);
-      await this.sendCommand('civolume');
+      if (this.state.targetVolume && this.state.targetVolume > 0) {
+        this.savedTargetVolume = this.state.targetVolume;
+        this.savedTargetUnit = this.state.targetUnit || 'ml';
+      }
+      this.isTimedRunActive = true;
       const targetSecs = parseTimeToSeconds(this.state.targetTime);
       this.state.strokeDurationSec = targetSecs;
+      this.state.strokeElapsedSec = 0;
+      this.runStartTime = Date.now();
+
+      // Single Timed Infusion: Clear target volume so pump runs strictly for the configured duration
+      await this.sendCommand('ctvolume');
+      await this.sendCommand(`ttime ${targetSecs} s`);
+      await this.sendCommand('civolume');
       this.state.statusText = `INFUSING (Timed: ${this.state.targetTime})`;
+      this.emitLog('info', `[▶] Starting timed infusion: ${this.state.targetTime} (${targetSecs}s) at ${rate} ${unit}.`);
     } else {
+      this.isTimedRunActive = false;
       // Volume-Targeted Infusion: Clear any residual target time
       await this.sendCommand('cttime');
       if (this.state.targetVolume && this.state.targetVolume > 0) {
@@ -1565,14 +1636,24 @@ export class Legato270WebController {
     await this.sendCommand(`wrate ${rate} ${unit}`);
 
     if (this.state.targetTimeEnabled && this.state.targetTime) {
-      // Single Timed Withdrawal: Clear target volume so pump runs strictly for the configured duration
-      await this.sendCommand('ctvolume');
-      await this.sendCommand(`ttime ${this.state.targetTime}`);
-      await this.sendCommand('cwvolume');
+      if (this.state.targetVolume && this.state.targetVolume > 0) {
+        this.savedTargetVolume = this.state.targetVolume;
+        this.savedTargetUnit = this.state.targetUnit || 'ml';
+      }
+      this.isTimedRunActive = true;
       const targetSecs = parseTimeToSeconds(this.state.targetTime);
       this.state.strokeDurationSec = targetSecs;
+      this.state.strokeElapsedSec = 0;
+      this.runStartTime = Date.now();
+
+      // Single Timed Withdrawal: Clear target volume so pump runs strictly for the configured duration
+      await this.sendCommand('ctvolume');
+      await this.sendCommand(`ttime ${targetSecs} s`);
+      await this.sendCommand('cwvolume');
       this.state.statusText = `WITHDRAWING (Timed: ${this.state.targetTime})`;
+      this.emitLog('info', `[◀] Starting timed withdrawal: ${this.state.targetTime} (${targetSecs}s) at ${rate} ${unit}.`);
     } else {
+      this.isTimedRunActive = false;
       // Volume-Targeted Withdrawal: Clear any residual target time
       await this.sendCommand('cttime');
       if (this.state.targetVolume && this.state.targetVolume > 0) {
@@ -1602,8 +1683,45 @@ export class Legato270WebController {
       this.programAbortController.abort();
       this.programAbortController = null;
     }
-    this.emitTelemetry();
     await this.sendCommand('stop');
+
+    if (this.isTimedRunActive || this.state.targetTimeEnabled) {
+      await this.reinstateOriginalStatus();
+    } else {
+      this.emitTelemetry();
+    }
+  }
+
+  /**
+   * Reinstates the pump's original target status:
+   * Clears target time, restores target volume on pump hardware and UI telemetry.
+   */
+  public async reinstateOriginalStatus(): Promise<void> {
+    const vol = this.savedTargetVolume ?? this.state.targetVolume ?? 5.0;
+    const unit = normalizeSerialUnit(this.savedTargetUnit ?? this.state.targetUnit ?? 'ml');
+
+    this.isTimedRunActive = false;
+    this.state.targetTimeEnabled = false;
+    this.runStartTime = 0;
+
+    // Restore telemetry targets
+    this.state.targetVolume = vol;
+    this.state.strokeTarget = vol;
+    this.state.targetUnit = unit;
+
+    // Hardware commands to clear target time and restore target volume
+    await this.sendCommand('cttime');
+    if (vol > 0) {
+      await this.sendCommand(`tvolume ${vol} ${unit}`);
+    }
+
+    // Refresh query to ensure pump display reflects restored target
+    await this.sendCommand('tvolume', false);
+    await this.sendCommand('ttime', false);
+    await this.sendCommand('poll', false);
+
+    this.emitTelemetry();
+    this.emitLog('info', `[✓] Original pump status reinstated: Target Volume = ${vol} ${unit}, Target Time cleared.`);
   }
 
   public async resetCounters(): Promise<void> {
@@ -1721,6 +1839,10 @@ export class Legato270WebController {
       this.state.strokeTarget = params.strokeTarget ?? params.targetVolume;
       this.state.infuseTarget = params.targetVolume;
       this.state.withdrawTarget = params.targetVolume;
+      if (params.targetVolume && params.targetVolume > 0) {
+        this.savedTargetVolume = params.targetVolume;
+        this.savedTargetUnit = params.targetUnit || this.state.targetUnit || 'ml';
+      }
       if (params.targetVolume === null || params.targetVolume <= 0) {
         await this.sendCommand('ctvolume');
       } else {
@@ -1737,13 +1859,15 @@ export class Legato270WebController {
       this.state.targetTime = params.targetTime;
     }
     if (this.state.targetTimeEnabled && this.state.targetTime) {
+      const targetSecs = parseTimeToSeconds(this.state.targetTime);
       await this.sendCommand('ctvolume');
-      await this.sendCommand(`ttime ${this.state.targetTime}`);
+      await this.sendCommand(`ttime ${targetSecs} s`);
     } else if (params.targetTimeEnabled === false || params.targetTime === null) {
       await this.sendCommand('cttime');
-      if (this.state.targetVolume && this.state.targetVolume > 0) {
-        const unit = normalizeSerialUnit(this.state.targetUnit || 'ml');
-        await this.sendCommand(`tvolume ${this.state.targetVolume} ${unit}`);
+      const vol = this.savedTargetVolume ?? this.state.targetVolume;
+      if (vol && vol > 0) {
+        const unit = normalizeSerialUnit(this.savedTargetUnit || this.state.targetUnit || 'ml');
+        await this.sendCommand(`tvolume ${vol} ${unit}`);
       }
     }
 
