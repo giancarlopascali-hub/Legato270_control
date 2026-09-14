@@ -154,6 +154,28 @@ export function formatSecondsToHms(totalSecs: number): string {
   return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
+/**
+ * Calculates the exact equivalent volume for a given flow rate and duration in seconds.
+ */
+export function calculateEquivalentVolume(
+  rate: number,
+  rateUnit: string,
+  durationSecs: number,
+  targetUnit: string = 'ml'
+): number {
+  if (!rate || !durationSecs || durationSecs <= 0) return 0;
+  const cleanRateUnit = normalizeSerialUnit(rateUnit);
+  let ratePerSec = rate / 60; // default per minute
+  if (cleanRateUnit.includes('/hr') || cleanRateUnit.includes('/h')) {
+    ratePerSec = rate / 3600;
+  } else if (cleanRateUnit.includes('/sec') || cleanRateUnit.includes('/s')) {
+    ratePerSec = rate;
+  }
+  const rateVolUnit = cleanRateUnit.startsWith('u') ? 'ul' : cleanRateUnit.startsWith('n') ? 'nl' : 'ml';
+  const totalVolumeInRateUnit = ratePerSec * durationSecs;
+  return convertVolume(totalVolumeInRateUnit, rateVolUnit, targetUnit);
+}
+
 export function isHardwarePromptOrNoise(str: string): boolean {
   if (!str) return true;
   const trimmed = str.trim();
@@ -796,7 +818,10 @@ export class Legato270WebController {
         const isTargetTime = !this.state.continuousActive && (this.isTimedRunActive || (this.state.targetTimeEnabled && !!this.state.targetTime));
         const targetSecs = isTargetTime ? parseTimeToSeconds(this.state.targetTime) : 0;
 
-        // Ignore stale pre-run T* prompts that arrive during the startup grace period
+        // Ignore stale pre-run T* prompts that arrive during configuration or startup grace period
+        if (this.isSettingParameters) {
+          return;
+        }
         if (wasRunning && runElapsedMs < 1500) {
           return;
         }
@@ -844,7 +869,7 @@ export class Legato270WebController {
       const targetSecs = isTargetTime ? parseTimeToSeconds(this.state.targetTime) : 0;
       const runElapsedMs = this.runStartTime > 0 ? (Date.now() - this.runStartTime) : 999999;
 
-      if (runElapsedMs < 1500) return;
+      if (this.isSettingParameters || runElapsedMs < 1500) return;
       if (isTargetTime && targetSecs > 0 && runElapsedMs < (targetSecs * 0.9 * 1000)) return;
 
       this.state.statusText = 'TARGET REACHED';
@@ -863,13 +888,16 @@ export class Legato270WebController {
     }
 
     if (lineLower.includes('stopped') || (lineLower.includes('idle') && !lineLower.includes('infus') && !lineLower.includes('withdr'))) {
-      if (!this.state.continuousActive && this.state.direction !== 'idle') {
-        this.state.statusText = 'STOPPED';
-        this.state.statusCategory = 'Idle';
-        this.state.direction = 'idle';
-        this.state.prompt = ':';
-        this.stopRunClock();
-        this.emitTelemetry();
+      if (!this.state.continuousActive && this.state.direction !== 'idle' && !this.isSettingParameters) {
+        const runElapsedMs = this.runStartTime > 0 ? (Date.now() - this.runStartTime) : 999999;
+        if (runElapsedMs >= 1500) {
+          this.state.statusText = 'STOPPED';
+          this.state.statusCategory = 'Idle';
+          this.state.direction = 'idle';
+          this.state.prompt = ':';
+          this.stopRunClock();
+          this.emitTelemetry();
+        }
       }
     }
 
@@ -1104,15 +1132,31 @@ export class Legato270WebController {
         this.state.direction = 'idle';
         this.stopRunClock();
         break;
-      case 'T*':
+      case 'T*': {
+        if (this.isSettingParameters) {
+          break;
+        }
+        const runElapsed = this.runStartTime > 0 ? (Date.now() - this.runStartTime) : 0;
+        const isRunning = this.state.direction === 'infuse' || this.state.direction === 'withdraw' || this.state.statusCategory === 'Running';
+        if (isRunning && runElapsed < 1500) {
+          break;
+        }
+        const isTimed = !this.state.continuousActive && (this.isTimedRunActive || (this.state.targetTimeEnabled && !!this.state.targetTime));
+        const targetSecs = isTimed ? parseTimeToSeconds(this.state.targetTime) : 0;
+        if (isTimed && targetSecs > 0 && runElapsed < (targetSecs * 0.9 * 1000)) {
+          break;
+        }
         this.state.statusText = 'TARGET REACHED';
         this.state.statusCategory = 'Idle';
         this.state.direction = 'idle';
         this.stopRunClock();
         if (this.state.continuousActive && !this.isTransitioningCycle) {
           this.handleContinuousTargetReached();
+        } else if (isTimed) {
+          this.reinstateOriginalStatus();
         }
         break;
+      }
       case '!':
         this.state.statusText = 'MOTOR STALLED / ALARM';
         this.state.statusCategory = 'Error';
@@ -1329,9 +1373,11 @@ export class Legato270WebController {
       this.state.currentStrokeVolume = 0;
       this.state.elapsedRunTimeSec = 0;
       rx = '00::';
-    } else if (lower === 'civolume' || lower === 'cwvolume') {
+    } else if (lower === 'civolume' || lower === 'cwvolume' || lower === 'citime' || lower === 'cwtime' || lower === 'ctime') {
       this.currentStrokeVolume = 0;
       this.state.currentStrokeVolume = 0;
+      this.state.strokeElapsedSec = 0;
+      this.state.prompt = ':';
       rx = '00::';
     } else if (lower === 'ivolume') {
       rx = `00:${this.state.infusedVolume.toFixed(4)} ml\n00:${this.state.prompt}`;
@@ -1613,121 +1659,171 @@ export class Legato270WebController {
   // -------------------------------------------------------------------------
 
   public async infuse() {
-    this.state.direction = 'infuse';
-    this.state.prompt = '>';
-    this.state.statusText = 'INFUSING';
-    this.state.statusCategory = 'Running';
-    this.state.isStalled = false;
-    this.state.stallMessage = '';
-    this.state.continuousActive = false;
-    this.hasMotorSpunUp = false;
-    this.runStartTime = Date.now();
+    this.isSettingParameters = true;
+    try {
+      this.state.isStalled = false;
+      this.state.stallMessage = '';
+      this.state.continuousActive = false;
+      this.hasMotorSpunUp = false;
 
-    // Preserve cumulative baseline so repeat tasks accumulate rather than zeroing
-    this.infusedVolumeBaseline = this.state.infusedVolume;
-    this.currentStrokeVolume = 0;
-    this.state.currentStrokeVolume = 0;
-    this.state.strokeElapsedSec = 0;
-    this.state.strokePercent = 0;
-    this.state.carriagePercent = 0;
-
-    this.startRunClock();
-    this.emitTelemetry();
-
-    // Ensure infuse rate is synchronized to hardware before run
-    const unit = normalizeSerialUnit(this.state.infuseRateUnit || this.state.flowUnit || 'ml/min');
-    const rate = this.state.infuseRate || this.state.flowRate || 2.5;
-    await this.sendCommand(`irate ${rate} ${unit}`);
-
-    const isTimed = this.state.targetMode === 'time' || (this.state.targetTimeEnabled && !!this.state.targetTime);
-    if (isTimed && this.state.targetTime) {
-      if (this.state.targetVolume && this.state.targetVolume > 0) {
-        this.savedTargetVolume = this.state.targetVolume;
-        this.savedTargetUnit = this.state.targetUnit || 'ml';
-      }
-      this.isTimedRunActive = true;
-      const targetSecs = parseTimeToSeconds(this.state.targetTime);
-      this.state.strokeDurationSec = targetSecs;
+      // Preserve cumulative baseline so repeat tasks accumulate rather than zeroing
+      this.infusedVolumeBaseline = this.state.infusedVolume;
+      this.currentStrokeVolume = 0;
+      this.state.currentStrokeVolume = 0;
       this.state.strokeElapsedSec = 0;
+      this.state.strokePercent = 0;
+      this.state.carriagePercent = 0;
 
-      // Single Timed Infusion: Clear target volume so pump runs strictly for the configured duration
-      await this.sendCommand('ctvolume');
-      await this.sendCommand(`ttime ${targetSecs} s`);
-      await this.sendCommand('civolume');
-      this.state.statusText = `INFUSING (Timed: ${this.state.targetTime})`;
-      this.emitLog('info', `[▶] Starting timed infusion: ${this.state.targetTime} (${targetSecs}s) at ${rate} ${unit}.`);
-    } else {
-      this.isTimedRunActive = false;
-      // Volume-Targeted Infusion: Clear any residual target time
-      await this.sendCommand('cttime');
-      if (this.state.targetVolume && this.state.targetVolume > 0) {
-        const volUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
-        await this.sendCommand(`tvolume ${this.state.targetVolume} ${volUnit}`);
+      // Ensure infuse rate is synchronized to hardware before run
+      const unit = normalizeSerialUnit(this.state.infuseRateUnit || this.state.flowUnit || 'ml/min');
+      const rate = this.state.infuseRate || this.state.flowRate || 2.5;
+      await this.sendCommand(`irate ${rate} ${unit}`);
+
+      const isTimed = this.state.targetMode === 'time' || (this.state.targetTimeEnabled && !!this.state.targetTime);
+      if (isTimed && this.state.targetTime) {
+        if (this.state.targetVolume && this.state.targetVolume > 0) {
+          this.savedTargetVolume = this.state.targetVolume;
+          this.savedTargetUnit = this.state.targetUnit || 'ml';
+        }
+        this.isTimedRunActive = true;
+        const targetSecs = parseTimeToSeconds(this.state.targetTime);
+        this.state.strokeDurationSec = targetSecs;
+        this.state.strokeElapsedSec = 0;
+
+        const targetUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
+        const eqVol = calculateEquivalentVolume(rate, unit, targetSecs, targetUnit);
+        this.state.strokeTarget = eqVol;
+        this.state.targetVolume = eqVol;
+
+        // Clear time and volume accumulators on pump hardware
+        await this.sendCommand('citime');
         await this.sendCommand('civolume');
+
+        // Program Target Time directly on hardware
+        await this.sendCommand(`ttime ${targetSecs} s`);
+
+        // Dual-synchronize matching target volume to guarantee hardware motor driver receives travel distance
+        if (eqVol > 0) {
+          const volStr = eqVol >= 1 ? eqVol.toFixed(4) : eqVol.toPrecision(4);
+          await this.sendCommand(`tvolume ${volStr} ${targetUnit}`);
+        }
+
+        this.state.statusText = `INFUSING (Timed: ${this.state.targetTime})`;
+        this.emitLog('info', `[▶] Starting timed infusion: ${this.state.targetTime} (${targetSecs}s, ${eqVol.toFixed(4)} ${targetUnit}) at ${rate} ${unit}.`);
       } else {
-        await this.sendCommand('ctvolume');
+        this.isTimedRunActive = false;
+        // Volume-Targeted Infusion: Clear any residual target time and reset accumulators
+        await this.sendCommand('cttime');
+        await this.sendCommand('citime');
+        await this.sendCommand('civolume');
+
+        if (this.state.targetVolume && this.state.targetVolume > 0) {
+          const volUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
+          await this.sendCommand(`tvolume ${this.state.targetVolume} ${volUnit}`);
+        } else {
+          await this.sendCommand('ctvolume');
+        }
+        this.state.statusText = 'INFUSING';
+        this.emitLog('info', `[▶] Starting infusion at ${rate} ${unit}.`);
       }
+
+      // Send hardware run command
+      await this.sendCommand('irun');
+
+      // Now that run command is dispatched to hardware, start clocks and update running direction
+      this.state.direction = 'infuse';
+      this.state.prompt = '>';
+      this.state.statusCategory = 'Running';
+      this.runStartTime = Date.now();
+      this.startRunClock();
+      this.emitTelemetry();
+    } finally {
+      this.isSettingParameters = false;
     }
-    await this.sendCommand('irun');
   }
 
   public async withdraw() {
-    this.state.direction = 'withdraw';
-    this.state.prompt = '<';
-    this.state.statusText = 'WITHDRAWING';
-    this.state.statusCategory = 'Running';
-    this.state.isStalled = false;
-    this.state.stallMessage = '';
-    this.state.continuousActive = false;
-    this.hasMotorSpunUp = false;
-    this.runStartTime = Date.now();
+    this.isSettingParameters = true;
+    try {
+      this.state.isStalled = false;
+      this.state.stallMessage = '';
+      this.state.continuousActive = false;
+      this.hasMotorSpunUp = false;
 
-    // Preserve cumulative baseline so repeat tasks accumulate rather than zeroing
-    this.withdrawnVolumeBaseline = this.state.withdrawnVolume;
-    this.currentStrokeVolume = 0;
-    this.state.currentStrokeVolume = 0;
-    this.state.strokeElapsedSec = 0;
-    this.state.strokePercent = 0;
-    this.state.carriagePercent = 100;
-
-    this.startRunClock();
-    this.emitTelemetry();
-
-    // Ensure withdraw rate (wrate) is synchronized to hardware before wrun
-    const unit = normalizeSerialUnit(this.state.withdrawRateUnit || this.state.flowUnit || 'ml/min');
-    const rate = this.state.withdrawRate || this.state.flowRate || 2.5;
-    await this.sendCommand(`wrate ${rate} ${unit}`);
-
-    const isTimed = this.state.targetMode === 'time' || (this.state.targetTimeEnabled && !!this.state.targetTime);
-    if (isTimed && this.state.targetTime) {
-      if (this.state.targetVolume && this.state.targetVolume > 0) {
-        this.savedTargetVolume = this.state.targetVolume;
-        this.savedTargetUnit = this.state.targetUnit || 'ml';
-      }
-      this.isTimedRunActive = true;
-      const targetSecs = parseTimeToSeconds(this.state.targetTime);
-      this.state.strokeDurationSec = targetSecs;
+      // Preserve cumulative baseline so repeat tasks accumulate rather than zeroing
+      this.withdrawnVolumeBaseline = this.state.withdrawnVolume;
+      this.currentStrokeVolume = 0;
+      this.state.currentStrokeVolume = 0;
       this.state.strokeElapsedSec = 0;
+      this.state.strokePercent = 0;
+      this.state.carriagePercent = 100;
 
-      // Single Timed Withdrawal: Clear target volume so pump runs strictly for the configured duration
-      await this.sendCommand('ctvolume');
-      await this.sendCommand(`ttime ${targetSecs} s`);
-      await this.sendCommand('cwvolume');
-      this.state.statusText = `WITHDRAWING (Timed: ${this.state.targetTime})`;
-      this.emitLog('info', `[◀] Starting timed withdrawal: ${this.state.targetTime} (${targetSecs}s) at ${rate} ${unit}.`);
-    } else {
-      this.isTimedRunActive = false;
-      // Volume-Targeted Withdrawal: Clear any residual target time
-      await this.sendCommand('cttime');
-      if (this.state.targetVolume && this.state.targetVolume > 0) {
-        const volUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
-        await this.sendCommand(`tvolume ${this.state.targetVolume} ${volUnit}`);
+      // Ensure withdraw rate (wrate) is synchronized to hardware before wrun
+      const unit = normalizeSerialUnit(this.state.withdrawRateUnit || this.state.flowUnit || 'ml/min');
+      const rate = this.state.withdrawRate || this.state.flowRate || 2.5;
+      await this.sendCommand(`wrate ${rate} ${unit}`);
+
+      const isTimed = this.state.targetMode === 'time' || (this.state.targetTimeEnabled && !!this.state.targetTime);
+      if (isTimed && this.state.targetTime) {
+        if (this.state.targetVolume && this.state.targetVolume > 0) {
+          this.savedTargetVolume = this.state.targetVolume;
+          this.savedTargetUnit = this.state.targetUnit || 'ml';
+        }
+        this.isTimedRunActive = true;
+        const targetSecs = parseTimeToSeconds(this.state.targetTime);
+        this.state.strokeDurationSec = targetSecs;
+        this.state.strokeElapsedSec = 0;
+
+        const targetUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
+        const eqVol = calculateEquivalentVolume(rate, unit, targetSecs, targetUnit);
+        this.state.strokeTarget = eqVol;
+        this.state.targetVolume = eqVol;
+
+        // Clear time and volume accumulators on pump hardware
+        await this.sendCommand('cwtime');
         await this.sendCommand('cwvolume');
+
+        // Program Target Time directly on hardware
+        await this.sendCommand(`ttime ${targetSecs} s`);
+
+        // Dual-synchronize matching target volume to guarantee hardware motor driver receives travel distance
+        if (eqVol > 0) {
+          const volStr = eqVol >= 1 ? eqVol.toFixed(4) : eqVol.toPrecision(4);
+          await this.sendCommand(`tvolume ${volStr} ${targetUnit}`);
+        }
+
+        this.state.statusText = `WITHDRAWING (Timed: ${this.state.targetTime})`;
+        this.emitLog('info', `[◀] Starting timed withdrawal: ${this.state.targetTime} (${targetSecs}s, ${eqVol.toFixed(4)} ${targetUnit}) at ${rate} ${unit}.`);
       } else {
-        await this.sendCommand('ctvolume');
+        this.isTimedRunActive = false;
+        // Volume-Targeted Withdrawal: Clear any residual target time and reset accumulators
+        await this.sendCommand('cttime');
+        await this.sendCommand('cwtime');
+        await this.sendCommand('cwvolume');
+
+        if (this.state.targetVolume && this.state.targetVolume > 0) {
+          const volUnit = normalizeSerialUnit(this.state.targetUnit || this.state.volumeUnit || 'ml');
+          await this.sendCommand(`tvolume ${this.state.targetVolume} ${volUnit}`);
+        } else {
+          await this.sendCommand('ctvolume');
+        }
+        this.state.statusText = 'WITHDRAWING';
+        this.emitLog('info', `[◀] Starting withdrawal at ${rate} ${unit}.`);
       }
+
+      // Send hardware run command
+      await this.sendCommand('wrun');
+
+      // Now that run command is dispatched to hardware, start clocks and update running direction
+      this.state.direction = 'withdraw';
+      this.state.prompt = '<';
+      this.state.statusCategory = 'Running';
+      this.runStartTime = Date.now();
+      this.startRunClock();
+      this.emitTelemetry();
+    } finally {
+      this.isSettingParameters = false;
     }
-    await this.sendCommand('wrun');
   }
 
   public async stop() {
@@ -1760,36 +1856,52 @@ export class Legato270WebController {
 
   /**
    * Reinstates the pump's original target status:
-   * Clears target time, restores target volume on pump hardware and UI telemetry.
+   * Restores target parameters and resets accumulators for the next run.
    */
   public async reinstateOriginalStatus(): Promise<void> {
-    const vol = this.savedTargetVolume ?? this.state.targetVolume ?? 5.0;
-    const unit = normalizeSerialUnit(this.savedTargetUnit ?? this.state.targetUnit ?? 'ml');
-
     this.isTimedRunActive = false;
-    this.state.targetTimeEnabled = false;
-    this.state.targetMode = 'volume';
     this.runStartTime = 0;
     this.hasMotorSpunUp = false;
 
-    // Restore telemetry targets
-    this.state.targetVolume = vol;
-    this.state.strokeTarget = vol;
-    this.state.targetUnit = unit;
+    if (this.state.targetMode === 'time') {
+      // User explicitly configured Time Mode: KEEP Time Mode active!
+      this.state.targetTimeEnabled = true;
+      const targetSecs = parseTimeToSeconds(this.state.targetTime || '00:00:30');
+      this.state.strokeDurationSec = targetSecs;
 
-    // Hardware commands to clear target time and restore target volume
-    await this.sendCommand('cttime');
-    if (vol > 0) {
-      await this.sendCommand(`tvolume ${vol} ${unit}`);
+      // Clear hardware accumulators so pump is immediately ready for next timed run
+      await this.sendCommand('citime');
+      await this.sendCommand('cwtime');
+      await this.sendCommand('civolume');
+      await this.sendCommand('cwvolume');
+      await this.sendCommand('ttime', false);
+      await this.sendCommand('tvolume', false);
+      this.emitTelemetry();
+      this.emitLog('info', `[✓] Timed run completed. Ready for next timed run: ${this.state.targetTime}. Accumulators cleared.`);
+    } else {
+      // Volume mode:
+      const vol = this.savedTargetVolume ?? this.state.targetVolume ?? 5.0;
+      const unit = normalizeSerialUnit(this.savedTargetUnit ?? this.state.targetUnit ?? 'ml');
+
+      this.state.targetTimeEnabled = false;
+      this.state.targetMode = 'volume';
+      this.state.targetVolume = vol;
+      this.state.strokeTarget = vol;
+      this.state.targetUnit = unit;
+
+      await this.sendCommand('cttime');
+      if (vol > 0) {
+        await this.sendCommand(`tvolume ${vol} ${unit}`);
+      }
+      await this.sendCommand('citime');
+      await this.sendCommand('cwtime');
+      await this.sendCommand('civolume');
+      await this.sendCommand('cwvolume');
+      await this.sendCommand('tvolume', false);
+      await this.sendCommand('ttime', false);
+      this.emitTelemetry();
+      this.emitLog('info', `[✓] Original pump status reinstated: Target Volume = ${vol} ${unit}.`);
     }
-
-    // Refresh query to ensure pump display reflects restored target
-    await this.sendCommand('tvolume', false);
-    await this.sendCommand('ttime', false);
-    await this.sendCommand('poll', false);
-
-    this.emitTelemetry();
-    this.emitLog('info', `[✓] Original pump status reinstated: Target Volume = ${vol} ${unit}, Target Time cleared.`);
   }
 
   public async resetCounters(): Promise<void> {
@@ -1817,7 +1929,10 @@ export class Legato270WebController {
     if (this.state.isRealHardware && this.port && this.port.writable) {
       await this.sendCommand('civolume');
       await this.sendCommand('cwvolume');
+      await this.sendCommand('citime');
+      await this.sendCommand('cwtime');
       await this.sendCommand('cvolume');
+      await this.sendCommand('ctime');
       await this.sendCommand('poll', false);
       await this.sendCommand('ivolume', false);
       await this.sendCommand('wvolume', false);
@@ -1925,22 +2040,38 @@ export class Legato270WebController {
         }
         const timeStr = this.state.targetTime || '00:00:30';
         const targetSecs = parseTimeToSeconds(timeStr);
+        this.state.strokeDurationSec = targetSecs;
 
-        // If transitioning from volume mode, clear target volume on pump first
-        if (prevMode === 'volume' || this.state.targetVolume !== null) {
-          this.state.targetVolume = null;
-          this.state.strokeTarget = null;
-          await this.sendCommand('ctvolume');
-          await new Promise((r) => setTimeout(r, 80));
-        }
+        const currentRate = this.state.infuseRate || this.state.flowRate || 2.5;
+        const currentUnit = this.state.infuseRateUnit || this.state.flowUnit || 'ml/min';
+        const targetUnit = normalizeSerialUnit(params.targetUnit || this.state.targetUnit || 'ml');
+        const eqVol = calculateEquivalentVolume(currentRate, currentUnit, targetSecs, targetUnit);
+
+        this.state.strokeTarget = eqVol;
+        this.state.targetVolume = eqVol;
+        this.state.targetUnit = targetUnit;
+
+        // Reset accumulators on the pump so target-reached state is cleared
+        await this.sendCommand('citime');
+        await this.sendCommand('cwtime');
+        await this.sendCommand('civolume');
+        await this.sendCommand('cwvolume');
 
         // Program Target Time directly on hardware
         await this.sendCommand(`ttime ${targetSecs} s`);
-        await new Promise((r) => setTimeout(r, 80));
+        await new Promise((r) => setTimeout(r, 60));
 
-        // Query back ttime so the pump confirms registration and telemetry updates on 1st click
+        // Dual-synchronize target volume so hardware motor driver receives valid non-zero travel length
+        if (eqVol > 0) {
+          const volStr = eqVol >= 1 ? eqVol.toFixed(4) : eqVol.toPrecision(4);
+          await this.sendCommand(`tvolume ${volStr} ${targetUnit}`);
+          await new Promise((r) => setTimeout(r, 60));
+        }
+
+        // Query back ttime and tvolume so the pump confirms registration and telemetry updates on 1st click
         await this.sendCommand('ttime', false);
-        this.emitLog('info', `[⚙] Target Mode set to TIME: ${timeStr} (${targetSecs}s). Target Volume cleared.`);
+        await this.sendCommand('tvolume', false);
+        this.emitLog('info', `[⚙] Target Mode set to TIME: ${timeStr} (${targetSecs}s, ${eqVol.toFixed(4)} ${targetUnit}). Accumulators cleared.`);
       } else {
         this.state.targetMode = 'volume';
         this.state.targetTimeEnabled = false;
@@ -1949,7 +2080,7 @@ export class Legato270WebController {
         if (prevMode === 'time' || this.state.targetTime !== null) {
           this.state.targetTime = null;
           await this.sendCommand('cttime');
-          await new Promise((r) => setTimeout(r, 80));
+          await new Promise((r) => setTimeout(r, 60));
         }
 
         if (params.targetVolume !== undefined && params.targetVolume !== null) {
@@ -1963,11 +2094,17 @@ export class Legato270WebController {
           }
         }
 
+        // Reset accumulators on the pump so target-reached state is cleared
+        await this.sendCommand('citime');
+        await this.sendCommand('cwtime');
+        await this.sendCommand('civolume');
+        await this.sendCommand('cwvolume');
+
         const vol = this.state.targetVolume ?? this.savedTargetVolume ?? 5.0;
         if (vol && vol > 0) {
           const unit = normalizeSerialUnit(params.targetUnit || this.savedTargetUnit || this.state.targetUnit || 'ml');
           await this.sendCommand(`tvolume ${vol} ${unit}`);
-          await new Promise((r) => setTimeout(r, 80));
+          await new Promise((r) => setTimeout(r, 60));
 
           // Query back tvolume so the pump confirms registration and telemetry updates on 1st click
           await this.sendCommand('tvolume', false);
