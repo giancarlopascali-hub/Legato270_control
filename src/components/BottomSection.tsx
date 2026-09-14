@@ -23,7 +23,8 @@ import {
   Send,
   HelpCircle,
   Clock,
-  Database
+  Database,
+  RefreshCw
 } from 'lucide-react';
 
 export const BottomSection: React.FC = () => {
@@ -56,6 +57,7 @@ export const BottomSection: React.FC = () => {
   const [targetTimeSecs, setTargetTimeSecs] = useState<number>(30);
 
   const [targetsSaved, setTargetsSaved] = useState<boolean>(false);
+  const [isApplyingTargets, setIsApplyingTargets] = useState<boolean>(false);
 
   // 3. Advanced Setup State
   const [selectedBaud, setSelectedBaud] = useState<number>(115200);
@@ -197,23 +199,31 @@ export const BottomSection: React.FC = () => {
 
   // Apply Target Settings, Dual Flow Rates & Exclusive Target Mode (Volume vs Time)
   const handleApplyTargets = async () => {
-    const isTime = targetMode === 'time';
-    const timeStr = isTime ? formatTimeStr(targetTimeHours, targetTimeMins, targetTimeSecs) : null;
+    if (isApplyingTargets) return;
+    setIsApplyingTargets(true);
+    try {
+      const isTime = targetMode === 'time';
+      const timeStr = isTime ? formatTimeStr(targetTimeHours, targetTimeMins, targetTimeSecs) : null;
 
-    await pumpController.setParameters({
-      infuseRate,
-      infuseRateUnit,
-      withdrawRate,
-      withdrawRateUnit,
-      targetMode,
-      targetVolume: isTime ? null : targetVolume,
-      targetUnit: targetVolumeUnit,
-      volumeUnit: targetVolumeUnit,
-      targetTime: timeStr,
-      targetTimeEnabled: isTime
-    });
-    setTargetsSaved(true);
-    setTimeout(() => setTargetsSaved(false), 2000);
+      await pumpController.setParameters({
+        infuseRate,
+        infuseRateUnit,
+        withdrawRate,
+        withdrawRateUnit,
+        targetMode,
+        targetVolume: isTime ? null : targetVolume,
+        targetUnit: targetVolumeUnit,
+        volumeUnit: targetVolumeUnit,
+        targetTime: timeStr,
+        targetTimeEnabled: isTime
+      });
+      setTargetsSaved(true);
+      setTimeout(() => setTargetsSaved(false), 2500);
+    } catch (err: any) {
+      console.error('Failed to apply targets:', err);
+    } finally {
+      setIsApplyingTargets(false);
+    }
   };
 
   // Apply Baud Rate
@@ -763,12 +773,24 @@ export const BottomSection: React.FC = () => {
             <button
               id="apply-targets-btn"
               onClick={handleApplyTargets}
-              className="w-full py-2 px-3 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold text-xs rounded-lg transition-colors flex items-center justify-center gap-1.5 shadow-2xs cursor-pointer"
+              disabled={isApplyingTargets}
+              className={`w-full py-2.5 px-3 font-semibold text-xs rounded-lg transition-all flex items-center justify-center gap-1.5 shadow-2xs ${
+                isApplyingTargets
+                  ? 'bg-blue-400 text-white cursor-wait opacity-90'
+                  : targetsSaved
+                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer shadow-xs'
+                  : 'bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white cursor-pointer hover:shadow-xs'
+              }`}
             >
-              {targetsSaved ? (
+              {isApplyingTargets ? (
                 <>
-                  <Check className="w-3.5 h-3.5 text-white" />
-                  <span>Settings Sent to Pump!</span>
+                  <RefreshCw className="w-3.5 h-3.5 text-white animate-spin" />
+                  <span>Programming Pump...</span>
+                </>
+              ) : targetsSaved ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-white stroke-[2.5]" />
+                  <span>Settings Confirmed on Pump!</span>
                 </>
               ) : (
                 <>

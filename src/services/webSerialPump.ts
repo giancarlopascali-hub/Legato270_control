@@ -205,6 +205,7 @@ export class Legato270WebController {
   private savedTargetVolume: number | null = 5.0;
   private savedTargetUnit: string = 'ml';
   private isTimedRunActive = false;
+  private isSettingParameters = false;
   private runStartTime = 0;
   private hasMotorSpunUp = false;
   private lastCommandWasInternal = false;
@@ -975,16 +976,18 @@ export class Legato270WebController {
 
     // 8. Parse target time (e.g. "00:05:00", "0:5:0", or "Target time not set")
     if (this.state.lastCommand?.toLowerCase().startsWith('ttime') || lineLower.includes('ttime')) {
-      if (lineLower.includes('not set') || lineLower.includes('disabled') || line.trim().endsWith('::') || line.trim() === '::') {
+      const cleanLine = line.replace(/^\d{1,2}:/, '').trim();
+      const cleanLower = cleanLine.toLowerCase();
+      if (cleanLower.includes('not set') || cleanLower.includes('disabled') || cleanLine.endsWith('::') || cleanLine === '::') {
         this.state.targetTime = null;
         this.state.targetTimeEnabled = false;
       } else {
-        const timeMatch = line.match(/(\d{1,2}:\d{2}:\d{2})/);
+        const timeMatch = cleanLine.match(/(\d{1,2}:\d{2}:\d{2})/);
         if (timeMatch) {
           this.state.targetTime = timeMatch[1];
           this.state.targetTimeEnabled = true;
         } else {
-          const secsMatch = line.match(/(\d+)\s*sec/i);
+          const secsMatch = cleanLine.match(/(\d+)\s*sec/i);
           if (secsMatch) {
             const s = parseInt(secsMatch[1], 10);
             if (s > 0) {
@@ -1129,7 +1132,7 @@ export class Legato270WebController {
   private startHardwarePolling() {
     this.stopHardwarePolling();
     this.pollTimer = setInterval(async () => {
-      if (this.isTransitioningCycle) return;
+      if (this.isTransitioningCycle || this.isSettingParameters) return;
       if (this.state.isRealHardware && this.state.isConnected && this.port && this.port.writable) {
         // Query status and prompt from hardware
         await this.sendCommand('status', false);
@@ -1193,8 +1196,8 @@ export class Legato270WebController {
           } finally {
             writer.releaseLock();
           }
-          // Small inter-command guard delay to let the pump's microcontroller process
-          await new Promise((r) => setTimeout(r, 60));
+          // Guard delay to let the pump's microcontroller process EEPROM/RAM registers before next command
+          await new Promise((r) => setTimeout(r, 120));
         } catch (err: any) {
           this.emitLog('error', `Write error: ${err.message}`);
           this.state.statusCategory = 'Error';
@@ -1844,115 +1847,150 @@ export class Legato270WebController {
     motorForce?: number;
     baudRate?: number;
   }) {
-    const syringeChanged = params.diameterMm !== undefined || params.syringeVolume !== undefined;
+    this.isSettingParameters = true;
+    try {
+      const syringeChanged = params.diameterMm !== undefined || params.syringeVolume !== undefined;
 
-    if (params.diameterMm !== undefined) {
-      this.state.diameterMm = params.diameterMm;
-      await this.sendCommand(`diameter ${params.diameterMm.toFixed(3)}`);
-    }
-    if (params.syringeVolume !== undefined) {
-      this.state.syringeVolume = params.syringeVolume;
-      this.state.syringeVolumeUnit = normalizeSerialUnit(params.syringeVolumeUnit || this.state.syringeVolumeUnit || 'ml');
-      await this.sendCommand(`svolume ${params.syringeVolume} ${this.state.syringeVolumeUnit}`);
-    }
-
-    if (params.targetUnit !== undefined) {
-      this.state.targetUnit = normalizeSerialUnit(params.targetUnit);
-      this.state.volumeUnit = normalizeSerialUnit(params.targetUnit);
-    }
-    if (params.volumeUnit !== undefined) {
-      this.state.volumeUnit = normalizeSerialUnit(params.volumeUnit);
-    }
-
-    // Handle Infuse Rate
-    const infRate = params.infuseRate ?? params.flowRate;
-    if (infRate !== undefined) {
-      const infUnit = normalizeSerialUnit(params.infuseRateUnit ?? params.flowUnit ?? this.state.infuseRateUnit ?? 'ml/min');
-      this.state.infuseRate = infRate;
-      this.state.infuseRateUnit = infUnit;
-      this.state.flowRate = infRate;
-      this.state.flowUnit = infUnit;
-      await this.sendCommand(`irate ${infRate} ${infUnit}`);
-    } else if (syringeChanged) {
-      // Re-assert current flow rate after syringe dimension change to prevent pump from clearing rates
-      const currentInfRate = this.state.infuseRate || this.state.flowRate || 2.5;
-      const currentInfUnit = normalizeSerialUnit(this.state.infuseRateUnit || this.state.flowUnit || 'ml/min');
-      await this.sendCommand(`irate ${currentInfRate} ${currentInfUnit}`);
-    }
-
-    // Handle Withdraw Rate
-    const wthRate = params.withdrawRate;
-    if (wthRate !== undefined) {
-      const wthUnit = normalizeSerialUnit(params.withdrawRateUnit ?? params.flowUnit ?? this.state.withdrawRateUnit ?? 'ml/min');
-      this.state.withdrawRate = wthRate;
-      this.state.withdrawRateUnit = wthUnit;
-      await this.sendCommand(`wrate ${wthRate} ${wthUnit}`);
-    } else if (syringeChanged) {
-      const currentWthRate = this.state.withdrawRate || this.state.flowRate || 2.5;
-      const currentWthUnit = normalizeSerialUnit(this.state.withdrawRateUnit || this.state.flowUnit || 'ml/min');
-      await this.sendCommand(`wrate ${currentWthRate} ${currentWthUnit}`);
-    }
-
-    // Query back diameter and svolume if syringe dimensions changed to keep telemetry confirmed
-    if (syringeChanged) {
-      await this.sendCommand('diameter', false);
-      await this.sendCommand('svolume', false);
-    }
-
-    // Handle Target Mode: Exclusive switch between Target Volume and Target Time
-    if (params.targetMode !== undefined) {
-      this.state.targetMode = params.targetMode;
-    }
-
-    const isTimeMode = this.state.targetMode === 'time' || (params.targetTimeEnabled === true);
-    if (isTimeMode) {
-      this.state.targetMode = 'time';
-      this.state.targetTimeEnabled = true;
-      if (params.targetTime !== undefined) {
-        this.state.targetTime = params.targetTime;
+      if (params.diameterMm !== undefined) {
+        this.state.diameterMm = params.diameterMm;
+        await this.sendCommand(`diameter ${params.diameterMm.toFixed(3)}`);
       }
-      const timeStr = this.state.targetTime || '00:00:30';
-      const targetSecs = parseTimeToSeconds(timeStr);
-      await this.sendCommand('ctvolume');
-      await this.sendCommand(`ttime ${targetSecs} s`);
-      this.emitLog('info', `[⚙] Target Mode set to TIME: ${timeStr} (${targetSecs}s). Target Volume cleared.`);
-    } else {
-      this.state.targetMode = 'volume';
-      this.state.targetTimeEnabled = false;
-      await this.sendCommand('cttime');
+      if (params.syringeVolume !== undefined) {
+        this.state.syringeVolume = params.syringeVolume;
+        this.state.syringeVolumeUnit = normalizeSerialUnit(params.syringeVolumeUnit || this.state.syringeVolumeUnit || 'ml');
+        await this.sendCommand(`svolume ${params.syringeVolume} ${this.state.syringeVolumeUnit}`);
+      }
 
-      if (params.targetVolume !== undefined) {
-        this.state.targetVolume = params.targetVolume;
-        this.state.strokeTarget = params.strokeTarget ?? params.targetVolume;
-        this.state.infuseTarget = params.targetVolume;
-        this.state.withdrawTarget = params.targetVolume;
-        if (params.targetVolume && params.targetVolume > 0) {
-          this.savedTargetVolume = params.targetVolume;
-          this.savedTargetUnit = params.targetUnit || this.state.targetUnit || 'ml';
+      if (params.targetUnit !== undefined) {
+        this.state.targetUnit = normalizeSerialUnit(params.targetUnit);
+        this.state.volumeUnit = normalizeSerialUnit(params.targetUnit);
+      }
+      if (params.volumeUnit !== undefined) {
+        this.state.volumeUnit = normalizeSerialUnit(params.volumeUnit);
+      }
+
+      // Handle Infuse Rate - only send if changed or syringe geometry changed
+      const infRate = params.infuseRate ?? params.flowRate;
+      if (infRate !== undefined) {
+        const infUnit = normalizeSerialUnit(params.infuseRateUnit ?? params.flowUnit ?? this.state.infuseRateUnit ?? 'ml/min');
+        const rateChanged = this.state.infuseRate !== infRate || this.state.infuseRateUnit !== infUnit;
+        this.state.infuseRate = infRate;
+        this.state.infuseRateUnit = infUnit;
+        this.state.flowRate = infRate;
+        this.state.flowUnit = infUnit;
+        if (rateChanged || syringeChanged) {
+          await this.sendCommand(`irate ${infRate} ${infUnit}`);
+        }
+      } else if (syringeChanged) {
+        // Re-assert current flow rate after syringe dimension change to prevent pump from clearing rates
+        const currentInfRate = this.state.infuseRate || this.state.flowRate || 2.5;
+        const currentInfUnit = normalizeSerialUnit(this.state.infuseRateUnit || this.state.flowUnit || 'ml/min');
+        await this.sendCommand(`irate ${currentInfRate} ${currentInfUnit}`);
+      }
+
+      // Handle Withdraw Rate - only send if changed or syringe geometry changed
+      const wthRate = params.withdrawRate;
+      if (wthRate !== undefined) {
+        const wthUnit = normalizeSerialUnit(params.withdrawRateUnit ?? params.flowUnit ?? this.state.withdrawRateUnit ?? 'ml/min');
+        const rateChanged = this.state.withdrawRate !== wthRate || this.state.withdrawRateUnit !== wthUnit;
+        this.state.withdrawRate = wthRate;
+        this.state.withdrawRateUnit = wthUnit;
+        if (rateChanged || syringeChanged) {
+          await this.sendCommand(`wrate ${wthRate} ${wthUnit}`);
+        }
+      } else if (syringeChanged) {
+        const currentWthRate = this.state.withdrawRate || this.state.flowRate || 2.5;
+        const currentWthUnit = normalizeSerialUnit(this.state.withdrawRateUnit || this.state.flowUnit || 'ml/min');
+        await this.sendCommand(`wrate ${currentWthRate} ${currentWthUnit}`);
+      }
+
+      // Query back diameter and svolume if syringe dimensions changed to keep telemetry confirmed
+      if (syringeChanged) {
+        await this.sendCommand('diameter', false);
+        await this.sendCommand('svolume', false);
+      }
+
+      // Handle Target Mode: Exclusive switch between Target Volume and Target Time
+      const prevMode = this.state.targetMode;
+      if (params.targetMode !== undefined) {
+        this.state.targetMode = params.targetMode;
+      }
+
+      const isTimeMode = this.state.targetMode === 'time' || (params.targetTimeEnabled === true);
+      if (isTimeMode) {
+        this.state.targetMode = 'time';
+        this.state.targetTimeEnabled = true;
+        if (params.targetTime !== undefined && params.targetTime !== null) {
+          this.state.targetTime = params.targetTime;
+        }
+        const timeStr = this.state.targetTime || '00:00:30';
+        const targetSecs = parseTimeToSeconds(timeStr);
+
+        // If transitioning from volume mode, clear target volume on pump first
+        if (prevMode === 'volume' || this.state.targetVolume !== null) {
+          this.state.targetVolume = null;
+          this.state.strokeTarget = null;
+          await this.sendCommand('ctvolume');
+          await new Promise((r) => setTimeout(r, 80));
+        }
+
+        // Program Target Time directly on hardware
+        await this.sendCommand(`ttime ${targetSecs} s`);
+        await new Promise((r) => setTimeout(r, 80));
+
+        // Query back ttime so the pump confirms registration and telemetry updates on 1st click
+        await this.sendCommand('ttime', false);
+        this.emitLog('info', `[⚙] Target Mode set to TIME: ${timeStr} (${targetSecs}s). Target Volume cleared.`);
+      } else {
+        this.state.targetMode = 'volume';
+        this.state.targetTimeEnabled = false;
+
+        // If transitioning from time mode, clear target time on pump first
+        if (prevMode === 'time' || this.state.targetTime !== null) {
+          this.state.targetTime = null;
+          await this.sendCommand('cttime');
+          await new Promise((r) => setTimeout(r, 80));
+        }
+
+        if (params.targetVolume !== undefined && params.targetVolume !== null) {
+          this.state.targetVolume = params.targetVolume;
+          this.state.strokeTarget = params.strokeTarget ?? params.targetVolume;
+          this.state.infuseTarget = params.targetVolume;
+          this.state.withdrawTarget = params.targetVolume;
+          if (params.targetVolume > 0) {
+            this.savedTargetVolume = params.targetVolume;
+            this.savedTargetUnit = params.targetUnit || this.state.targetUnit || 'ml';
+          }
+        }
+
+        const vol = this.state.targetVolume ?? this.savedTargetVolume ?? 5.0;
+        if (vol && vol > 0) {
+          const unit = normalizeSerialUnit(params.targetUnit || this.savedTargetUnit || this.state.targetUnit || 'ml');
+          await this.sendCommand(`tvolume ${vol} ${unit}`);
+          await new Promise((r) => setTimeout(r, 80));
+
+          // Query back tvolume so the pump confirms registration and telemetry updates on 1st click
+          await this.sendCommand('tvolume', false);
+          this.emitLog('info', `[⚙] Target Mode set to VOLUME: ${vol} ${unit}. Target Time cleared.`);
+        } else {
+          await this.sendCommand('ctvolume');
         }
       }
 
-      const vol = this.state.targetVolume ?? this.savedTargetVolume ?? 5.0;
-      if (vol && vol > 0) {
-        const unit = normalizeSerialUnit(params.targetUnit || this.savedTargetUnit || this.state.targetUnit || 'ml');
-        await this.sendCommand(`tvolume ${vol} ${unit}`);
-        this.emitLog('info', `[⚙] Target Mode set to VOLUME: ${vol} ${unit}. Target Time cleared.`);
-      } else {
-        await this.sendCommand('ctvolume');
+      if (params.motorForce !== undefined) {
+        this.state.motorForce = params.motorForce;
+        await this.sendCommand(`force ${params.motorForce}`);
       }
-    }
+      if (params.baudRate !== undefined) {
+        this.state.baudRate = params.baudRate;
+        await this.sendCommand(`baud ${params.baudRate}`);
+      }
 
-    if (params.motorForce !== undefined) {
-      this.state.motorForce = params.motorForce;
-      await this.sendCommand(`force ${params.motorForce}`);
+      this.emitTelemetry();
+      await this.sendCommand('poll', false);
+    } finally {
+      this.isSettingParameters = false;
     }
-    if (params.baudRate !== undefined) {
-      this.state.baudRate = params.baudRate;
-      await this.sendCommand(`baud ${params.baudRate}`);
-    }
-
-    this.emitTelemetry();
-    await this.sendCommand('poll', false);
   }
 
   // -------------------------------------------------------------------------
