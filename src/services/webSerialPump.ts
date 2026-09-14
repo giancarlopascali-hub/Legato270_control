@@ -38,7 +38,8 @@ export interface PumpTelemetry {
   strokeTarget: number | null;
   infuseTarget?: number | null;
   withdrawTarget?: number | null;
-  // Target Time
+  // Target Mode & Target Time
+  targetMode: 'volume' | 'time';
   targetTime: string | null; // e.g. "00:05:00"
   targetTimeEnabled: boolean;
   // Accumulated volumes
@@ -205,6 +206,10 @@ export class Legato270WebController {
   private savedTargetUnit: string = 'ml';
   private isTimedRunActive = false;
   private runStartTime = 0;
+  private hasMotorSpunUp = false;
+  private lastCommandWasInternal = false;
+  private lastEmittedRxLine = '';
+  private lastEmittedRxTime = 0;
 
   private telemetryListeners: TelemetryListener[] = [];
   private logListeners: LogListener[] = [];
@@ -227,6 +232,7 @@ export class Legato270WebController {
     infuseRateUnit: 'ml/min',
     withdrawRate: 2.5,
     withdrawRateUnit: 'ml/min',
+    targetMode: 'volume',
     targetVolume: 5.0,
     targetUnit: 'ml',
     volumeUnit: 'ml',
@@ -605,6 +611,9 @@ export class Legato270WebController {
       // Flag 6 (index 5): Target volume reached - 'T' = reached, '.' = not reached
       const flagTarget = (flags.length >= 6 && flags.charAt(5) === 'T') || flagMotor === 't';
       const isMotorRunning = flagMotor === 'I' || flagMotor === 'W';
+      if (isMotorRunning) {
+        this.hasMotorSpunUp = true;
+      }
 
       // Check stall / alarm flags
       if (flagStall === 'S' || flagStall === '*' || flags.includes('*') || flags.includes('!')) {
@@ -688,18 +697,28 @@ export class Legato270WebController {
         this.startRunClock();
       }
 
-      // Check target reached: Only declared when the motor was actively running and has now stopped ('i', 'w', 's', 't')
-      // OR target reached flag is set by hardware
+      // Check target reached:
+      // Enforce a minimum 1.5s grace period so startup transients and pre-run buffered flags don't prematurely stop runs
       let isTargetFinished = false;
       const wasRunning = this.state.direction === 'infuse' || this.state.direction === 'withdraw' || this.state.statusCategory === 'Running';
-      if (!isMotorRunning && wasRunning) {
+      const runElapsedMs = this.runStartTime > 0 ? (Date.now() - this.runStartTime) : 999999;
+
+      if (wasRunning && runElapsedMs >= 1500) {
         if (isTargetTime && targetSecs > 0) {
-          isTargetFinished = flagTarget || elapsedSecs >= targetSecs * 0.95;
+          // Timed Run: Must reach target duration or motor spun up and stopped after >= 90% of duration
+          if (elapsedSecs >= targetSecs) {
+            isTargetFinished = true;
+          } else if (!isMotorRunning && this.hasMotorSpunUp && elapsedSecs >= targetSecs * 0.9) {
+            isTargetFinished = true;
+          }
         } else {
-          isTargetFinished = flagTarget || (targetVol > 0 && volInTargetUnit >= targetVol * 0.995);
+          // Target Volume Run: Motor spun up and stopped, or target volume reached
+          if (!isMotorRunning && this.hasMotorSpunUp) {
+            isTargetFinished = flagTarget || (targetVol > 0 && volInTargetUnit >= targetVol * 0.98);
+          } else if (flagTarget && this.hasMotorSpunUp && (volInTargetUnit >= targetVol * 0.9 || runElapsedMs >= 3000)) {
+            isTargetFinished = true;
+          }
         }
-      } else if (flagTarget && wasRunning) {
-        isTargetFinished = true;
       }
 
       if (isTargetFinished) {
@@ -710,6 +729,7 @@ export class Legato270WebController {
         this.state.direction = 'idle';
         this.state.isStalled = false;
         this.state.strokePercent = 100;
+        this.hasMotorSpunUp = false;
         this.infusedVolumeBaseline = this.state.infusedVolume;
         this.withdrawnVolumeBaseline = this.state.withdrawnVolume;
         if (this.state.cyclePhase === 'infusing_A' || finishedDir === 'infuse') {
@@ -732,13 +752,17 @@ export class Legato270WebController {
       return;
     }
 
-    // Suppress raw periodic poll prompt echoes (e.g. ":", "00:", "00>", "00<", "Polling mode is ON")
-    // from cluttering the terminal while keeping meaningful responses, stall alerts, and manual commands visible
-    if (!isHardwarePromptOrNoise(line)) {
+    const lineLower = line.toLowerCase();
+
+    // Suppress raw periodic poll prompt echoes, noise, and internal telemetry queries from cluttering the terminal log
+    const isInternalQuery = this.lastCommandWasInternal && !lineLower.includes('error') && !lineLower.includes('stall') && !lineLower.includes('alarm');
+    const isDuplicateRx = line === this.lastEmittedRxLine && (Date.now() - this.lastEmittedRxTime < 2500);
+
+    if (!isHardwarePromptOrNoise(line) && !isInternalQuery && !isDuplicateRx) {
+      this.lastEmittedRxLine = line;
+      this.lastEmittedRxTime = Date.now();
       this.emitLog('rx', line);
     }
-
-    const lineLower = line.toLowerCase();
 
     // 1. Direct text or prompt-based stall & alarm detection from hardware
     const isStallAlarmText =
@@ -766,12 +790,26 @@ export class Legato270WebController {
     if (isStallAlarmText || isStallPrompt) {
       // Check if it is T* (target reached) vs * / ! (stall)
       if (line.endsWith('T*') || line.includes('00T*') || line.includes('00:T*') || lineLower.includes('target reached')) {
+        const wasRunning = this.state.direction === 'infuse' || this.state.direction === 'withdraw' || this.state.statusCategory === 'Running';
+        const runElapsedMs = this.runStartTime > 0 ? (Date.now() - this.runStartTime) : 999999;
+        const isTargetTime = !this.state.continuousActive && (this.isTimedRunActive || (this.state.targetTimeEnabled && !!this.state.targetTime));
+        const targetSecs = isTargetTime ? parseTimeToSeconds(this.state.targetTime) : 0;
+
+        // Ignore stale pre-run T* prompts that arrive during the startup grace period
+        if (wasRunning && runElapsedMs < 1500) {
+          return;
+        }
+        if (isTargetTime && targetSecs > 0 && runElapsedMs < (targetSecs * 0.9 * 1000)) {
+          return;
+        }
+
         this.state.statusText = 'TARGET REACHED';
         this.state.statusCategory = 'Idle';
         this.state.prompt = 'T*';
         this.state.direction = 'idle';
         this.state.isStalled = false;
         this.state.strokePercent = 100;
+        this.hasMotorSpunUp = false;
         if (this.state.cyclePhase === 'infusing_A') {
           this.state.carriagePercent = 100;
         } else if (this.state.cyclePhase === 'withdrawing_A') {
@@ -780,6 +818,8 @@ export class Legato270WebController {
         this.stopRunClock();
         if (this.state.continuousActive && !this.isTransitioningCycle) {
           this.handleContinuousTargetReached();
+        } else if (isTargetTime || this.isTimedRunActive) {
+          this.reinstateOriginalStatus();
         }
         this.emitTelemetry();
         return;
@@ -799,13 +839,23 @@ export class Legato270WebController {
 
     // 1.1 Direct text status keywords from hardware responses (e.g. "00:Target reached", "00:Stopped", "00:Infusing at...")
     if (lineLower.includes('target reached') || lineLower.includes('target volume reached') || lineLower.includes('target time reached')) {
+      const isTargetTime = !this.state.continuousActive && (this.isTimedRunActive || (this.state.targetTimeEnabled && !!this.state.targetTime));
+      const targetSecs = isTargetTime ? parseTimeToSeconds(this.state.targetTime) : 0;
+      const runElapsedMs = this.runStartTime > 0 ? (Date.now() - this.runStartTime) : 999999;
+
+      if (runElapsedMs < 1500) return;
+      if (isTargetTime && targetSecs > 0 && runElapsedMs < (targetSecs * 0.9 * 1000)) return;
+
       this.state.statusText = 'TARGET REACHED';
       this.state.statusCategory = 'Idle';
       this.state.direction = 'idle';
       this.state.prompt = 'T*';
+      this.hasMotorSpunUp = false;
       this.stopRunClock();
       if (this.state.continuousActive && !this.isTransitioningCycle) {
         this.handleContinuousTargetReached();
+      } else if (isTargetTime || this.isTimedRunActive) {
+        this.reinstateOriginalStatus();
       }
       this.emitTelemetry();
       return;
@@ -1083,10 +1133,15 @@ export class Legato270WebController {
       if (this.state.isRealHardware && this.state.isConnected && this.port && this.port.writable) {
         // Query status and prompt from hardware
         await this.sendCommand('status', false);
-        if (this.state.direction === 'infuse' || this.state.cyclePhase === 'infusing_A') {
-          await this.sendCommand('ivolume', false);
-        } else if (this.state.direction === 'withdraw' || this.state.cyclePhase === 'withdrawing_A') {
-          await this.sendCommand('wvolume', false);
+        // Only query live stroke volumes when the motor is actively running!
+        // When stopped or idle, suppress volume polling to avoid spamming the log and serial bus with repetitive static readings.
+        const isActivelyMoving = this.state.statusCategory === 'Running' && this.state.direction !== 'idle';
+        if (isActivelyMoving) {
+          if (this.state.direction === 'infuse' || this.state.cyclePhase === 'infusing_A') {
+            await this.sendCommand('ivolume', false);
+          } else if (this.state.direction === 'withdraw' || this.state.cyclePhase === 'withdrawing_A') {
+            await this.sendCommand('wvolume', false);
+          }
         }
       }
     }, 450);
@@ -1121,6 +1176,7 @@ export class Legato270WebController {
       if (!cleanCmd) return;
 
       this.state.lastCommand = cleanCmd;
+      this.lastCommandWasInternal = !logTx;
 
       if (logTx) {
         this.emitLog('tx', cleanCmd);
@@ -1561,6 +1617,8 @@ export class Legato270WebController {
     this.state.isStalled = false;
     this.state.stallMessage = '';
     this.state.continuousActive = false;
+    this.hasMotorSpunUp = false;
+    this.runStartTime = Date.now();
 
     // Preserve cumulative baseline so repeat tasks accumulate rather than zeroing
     this.infusedVolumeBaseline = this.state.infusedVolume;
@@ -1578,7 +1636,8 @@ export class Legato270WebController {
     const rate = this.state.infuseRate || this.state.flowRate || 2.5;
     await this.sendCommand(`irate ${rate} ${unit}`);
 
-    if (this.state.targetTimeEnabled && this.state.targetTime) {
+    const isTimed = this.state.targetMode === 'time' || (this.state.targetTimeEnabled && !!this.state.targetTime);
+    if (isTimed && this.state.targetTime) {
       if (this.state.targetVolume && this.state.targetVolume > 0) {
         this.savedTargetVolume = this.state.targetVolume;
         this.savedTargetUnit = this.state.targetUnit || 'ml';
@@ -1587,7 +1646,6 @@ export class Legato270WebController {
       const targetSecs = parseTimeToSeconds(this.state.targetTime);
       this.state.strokeDurationSec = targetSecs;
       this.state.strokeElapsedSec = 0;
-      this.runStartTime = Date.now();
 
       // Single Timed Infusion: Clear target volume so pump runs strictly for the configured duration
       await this.sendCommand('ctvolume');
@@ -1618,6 +1676,8 @@ export class Legato270WebController {
     this.state.isStalled = false;
     this.state.stallMessage = '';
     this.state.continuousActive = false;
+    this.hasMotorSpunUp = false;
+    this.runStartTime = Date.now();
 
     // Preserve cumulative baseline so repeat tasks accumulate rather than zeroing
     this.withdrawnVolumeBaseline = this.state.withdrawnVolume;
@@ -1635,7 +1695,8 @@ export class Legato270WebController {
     const rate = this.state.withdrawRate || this.state.flowRate || 2.5;
     await this.sendCommand(`wrate ${rate} ${unit}`);
 
-    if (this.state.targetTimeEnabled && this.state.targetTime) {
+    const isTimed = this.state.targetMode === 'time' || (this.state.targetTimeEnabled && !!this.state.targetTime);
+    if (isTimed && this.state.targetTime) {
       if (this.state.targetVolume && this.state.targetVolume > 0) {
         this.savedTargetVolume = this.state.targetVolume;
         this.savedTargetUnit = this.state.targetUnit || 'ml';
@@ -1644,7 +1705,6 @@ export class Legato270WebController {
       const targetSecs = parseTimeToSeconds(this.state.targetTime);
       this.state.strokeDurationSec = targetSecs;
       this.state.strokeElapsedSec = 0;
-      this.runStartTime = Date.now();
 
       // Single Timed Withdrawal: Clear target volume so pump runs strictly for the configured duration
       await this.sendCommand('ctvolume');
@@ -1671,11 +1731,14 @@ export class Legato270WebController {
     this.state.continuousActive = false;
     this.state.isProgramRunning = false;
     this.state.direction = 'idle';
+    this.state.cyclePhase = 'idle';
     this.state.prompt = ':';
     this.state.statusText = 'STOPPED';
     this.state.statusCategory = 'Idle';
     this.state.isStalled = false;
     this.state.stallMessage = '';
+    this.hasMotorSpunUp = false;
+    this.runStartTime = 0;
     this.infusedVolumeBaseline = this.state.infusedVolume;
     this.withdrawnVolumeBaseline = this.state.withdrawnVolume;
     this.stopRunClock();
@@ -1685,7 +1748,7 @@ export class Legato270WebController {
     }
     await this.sendCommand('stop');
 
-    if (this.isTimedRunActive || this.state.targetTimeEnabled) {
+    if (this.isTimedRunActive || this.state.targetTimeEnabled || this.state.targetMode === 'time') {
       await this.reinstateOriginalStatus();
     } else {
       this.emitTelemetry();
@@ -1702,7 +1765,9 @@ export class Legato270WebController {
 
     this.isTimedRunActive = false;
     this.state.targetTimeEnabled = false;
+    this.state.targetMode = 'volume';
     this.runStartTime = 0;
+    this.hasMotorSpunUp = false;
 
     // Restore telemetry targets
     this.state.targetVolume = vol;
@@ -1767,6 +1832,7 @@ export class Legato270WebController {
     infuseRateUnit?: string;
     withdrawRate?: number;
     withdrawRateUnit?: string;
+    targetMode?: 'volume' | 'time';
     targetVolume?: number | null;
     targetUnit?: string;
     volumeUnit?: string;
@@ -1833,41 +1899,46 @@ export class Legato270WebController {
       await this.sendCommand('svolume', false);
     }
 
-    // Handle Target Volume (Single tvolume for the pump)
-    if (params.targetVolume !== undefined) {
-      this.state.targetVolume = params.targetVolume;
-      this.state.strokeTarget = params.strokeTarget ?? params.targetVolume;
-      this.state.infuseTarget = params.targetVolume;
-      this.state.withdrawTarget = params.targetVolume;
-      if (params.targetVolume && params.targetVolume > 0) {
-        this.savedTargetVolume = params.targetVolume;
-        this.savedTargetUnit = params.targetUnit || this.state.targetUnit || 'ml';
-      }
-      if (params.targetVolume === null || params.targetVolume <= 0) {
-        await this.sendCommand('ctvolume');
-      } else {
-        const unit = normalizeSerialUnit(params.targetUnit || this.state.targetUnit || 'ml');
-        await this.sendCommand(`tvolume ${params.targetVolume} ${unit}`);
-      }
+    // Handle Target Mode: Exclusive switch between Target Volume and Target Time
+    if (params.targetMode !== undefined) {
+      this.state.targetMode = params.targetMode;
     }
 
-    // Handle Target Time (Used only for single infuse/withdraw modes, not continuous)
-    if (params.targetTimeEnabled !== undefined) {
-      this.state.targetTimeEnabled = params.targetTimeEnabled;
-    }
-    if (params.targetTime !== undefined) {
-      this.state.targetTime = params.targetTime;
-    }
-    if (this.state.targetTimeEnabled && this.state.targetTime) {
-      const targetSecs = parseTimeToSeconds(this.state.targetTime);
+    const isTimeMode = this.state.targetMode === 'time' || (params.targetTimeEnabled === true);
+    if (isTimeMode) {
+      this.state.targetMode = 'time';
+      this.state.targetTimeEnabled = true;
+      if (params.targetTime !== undefined) {
+        this.state.targetTime = params.targetTime;
+      }
+      const timeStr = this.state.targetTime || '00:00:30';
+      const targetSecs = parseTimeToSeconds(timeStr);
       await this.sendCommand('ctvolume');
       await this.sendCommand(`ttime ${targetSecs} s`);
-    } else if (params.targetTimeEnabled === false || params.targetTime === null) {
+      this.emitLog('info', `[⚙] Target Mode set to TIME: ${timeStr} (${targetSecs}s). Target Volume cleared.`);
+    } else {
+      this.state.targetMode = 'volume';
+      this.state.targetTimeEnabled = false;
       await this.sendCommand('cttime');
-      const vol = this.savedTargetVolume ?? this.state.targetVolume;
+
+      if (params.targetVolume !== undefined) {
+        this.state.targetVolume = params.targetVolume;
+        this.state.strokeTarget = params.strokeTarget ?? params.targetVolume;
+        this.state.infuseTarget = params.targetVolume;
+        this.state.withdrawTarget = params.targetVolume;
+        if (params.targetVolume && params.targetVolume > 0) {
+          this.savedTargetVolume = params.targetVolume;
+          this.savedTargetUnit = params.targetUnit || this.state.targetUnit || 'ml';
+        }
+      }
+
+      const vol = this.state.targetVolume ?? this.savedTargetVolume ?? 5.0;
       if (vol && vol > 0) {
-        const unit = normalizeSerialUnit(this.savedTargetUnit || this.state.targetUnit || 'ml');
+        const unit = normalizeSerialUnit(params.targetUnit || this.savedTargetUnit || this.state.targetUnit || 'ml');
         await this.sendCommand(`tvolume ${vol} ${unit}`);
+        this.emitLog('info', `[⚙] Target Mode set to VOLUME: ${vol} ${unit}. Target Time cleared.`);
+      } else {
+        await this.sendCommand('ctvolume');
       }
     }
 
@@ -2172,6 +2243,13 @@ export class Legato270WebController {
     } finally {
       this.state.isProgramRunning = false;
       this.state.currentProgramStep = 0;
+      this.state.direction = 'idle';
+      this.state.cyclePhase = 'idle';
+      this.state.statusCategory = 'Idle';
+      this.state.statusText = 'PROGRAM COMPLETED (Idle)';
+      this.hasMotorSpunUp = false;
+      this.runStartTime = 0;
+      this.stopRunClock();
       this.emitTelemetry();
     }
   }

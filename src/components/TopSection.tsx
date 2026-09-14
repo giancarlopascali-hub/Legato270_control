@@ -757,16 +757,18 @@ export const TopSection: React.FC = () => {
 
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           
-          {/* Target Volume (tvolume) */}
+          {/* Target Limit (Volume or Time) */}
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
             <span className="text-[10px] uppercase tracking-wider text-slate-500 font-bold block">
-              Target Volume (tvolume)
+              {telemetry.targetMode === 'time' || (telemetry.targetTimeEnabled && telemetry.targetTime) ? 'Target Time (ttime)' : 'Target Volume (tvolume)'}
             </span>
             <div className="text-base font-mono font-bold text-slate-900 mt-1 truncate">
-              {telemetry.targetVolume ? `${telemetry.targetVolume} ${formatDisplayUnit(telemetry.targetUnit || 'ml')}` : 'Continuous'}
+              {telemetry.targetMode === 'time' || (telemetry.targetTimeEnabled && telemetry.targetTime)
+                ? (telemetry.targetTime || '00:00:30')
+                : (telemetry.targetVolume ? `${telemetry.targetVolume} ${formatDisplayUnit(telemetry.targetUnit || 'ml')}` : 'Continuous')}
             </div>
             <span className="text-[10px] text-slate-500 block mt-0.5">
-              {telemetry.targetTimeEnabled && telemetry.targetTime ? `Timer: ${telemetry.targetTime}` : 'Per-stroke limit'}
+              {telemetry.targetMode === 'time' || (telemetry.targetTimeEnabled && telemetry.targetTime) ? 'Timed single run' : 'Per-stroke limit'}
             </span>
           </div>
 

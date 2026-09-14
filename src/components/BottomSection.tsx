@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { pumpController, PumpTelemetry, formatDisplayUnit } from '../services/webSerialPump';
+import { pumpController, PumpTelemetry, formatDisplayUnit, convertVolume } from '../services/webSerialPump';
 import { SYRINGE_PRESETS } from '../data/legatoCommands';
 import { ProgramStep } from '../types';
 import {
@@ -21,7 +21,9 @@ import {
   Pencil,
   X,
   Send,
-  HelpCircle
+  HelpCircle,
+  Clock,
+  Database
 } from 'lucide-react';
 
 export const BottomSection: React.FC = () => {
@@ -43,15 +45,15 @@ export const BottomSection: React.FC = () => {
 
   const [syncRates, setSyncRates] = useState<boolean>(true);
 
-  // Single unified target volume (tvolume)
+  // Target Mode: Exclusive switch between Target Volume (default) and Target Time
+  const [targetMode, setTargetMode] = useState<'volume' | 'time'>('volume');
   const [targetVolume, setTargetVolume] = useState<number>(5.0);
   const [targetVolumeUnit, setTargetVolumeUnit] = useState<'ml' | 'ul' | 'nl'>('ml');
 
-  // Target Time for infuse/withdraw only
-  const [targetTimeEnabled, setTargetTimeEnabled] = useState<boolean>(false);
+  // Target Time duration (for Target Time mode)
   const [targetTimeHours, setTargetTimeHours] = useState<number>(0);
-  const [targetTimeMins, setTargetTimeMins] = useState<number>(5);
-  const [targetTimeSecs, setTargetTimeSecs] = useState<number>(0);
+  const [targetTimeMins, setTargetTimeMins] = useState<number>(0);
+  const [targetTimeSecs, setTargetTimeSecs] = useState<number>(30);
 
   const [targetsSaved, setTargetsSaved] = useState<boolean>(false);
 
@@ -149,13 +151,19 @@ export const BottomSection: React.FC = () => {
     if (t.targetUnit) {
       setTargetVolumeUnit(t.targetUnit as any);
     }
+    if (t.targetMode) {
+      setTargetMode(t.targetMode);
+    } else if (t.targetTimeEnabled && t.targetTime) {
+      setTargetMode('time');
+    } else {
+      setTargetMode('volume');
+    }
     if (t.targetTime) {
       const parts = t.targetTime.split(':').map(Number);
       if (parts.length === 3) {
         setTargetTimeHours(parts[0] || 0);
         setTargetTimeMins(parts[1] || 0);
         setTargetTimeSecs(parts[2] || 0);
-        setTargetTimeEnabled(true);
       }
     }
   };
@@ -187,20 +195,22 @@ export const BottomSection: React.FC = () => {
     setTimeout(() => setDiameterSaved(false), 2000);
   };
 
-  // Apply Target Volume, Dual Flow Rates & Target Time - sends ONLY flow rates and targets, leaving diameter untouched
+  // Apply Target Settings, Dual Flow Rates & Exclusive Target Mode (Volume vs Time)
   const handleApplyTargets = async () => {
-    const timeStr = targetTimeEnabled ? formatTimeStr(targetTimeHours, targetTimeMins, targetTimeSecs) : null;
+    const isTime = targetMode === 'time';
+    const timeStr = isTime ? formatTimeStr(targetTimeHours, targetTimeMins, targetTimeSecs) : null;
 
     await pumpController.setParameters({
       infuseRate,
       infuseRateUnit,
       withdrawRate,
       withdrawRateUnit,
-      targetVolume,
+      targetMode,
+      targetVolume: isTime ? null : targetVolume,
       targetUnit: targetVolumeUnit,
       volumeUnit: targetVolumeUnit,
       targetTime: timeStr,
-      targetTimeEnabled
+      targetTimeEnabled: isTime
     });
     setTargetsSaved(true);
     setTimeout(() => setTargetsSaved(false), 2000);
@@ -567,105 +577,183 @@ export const BottomSection: React.FC = () => {
                 </div>
               </div>
 
-              {/* Single Target Volume (tvolume) */}
-              <div className="pt-1">
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-xs font-semibold text-slate-700">
-                    Target Volume (tvolume / ivolume):
-                  </label>
-                  <span className="text-[11px] font-mono text-blue-700 font-semibold">
-                    Current: {telemetry.targetVolume || telemetry.strokeTarget || 0} {formatDisplayUnit(telemetry.targetUnit || 'ml')}
-                  </span>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <input
-                    id="target-volume-input"
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    value={targetVolume}
-                    onChange={(e) => setTargetVolume(parseFloat(e.target.value) || 0)}
-                    className="px-3 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                  <select
-                    id="target-volume-unit-select"
-                    value={targetVolumeUnit}
-                    onChange={(e) => setTargetVolumeUnit(e.target.value as any)}
-                    className="px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="ml">ml</option>
-                    <option value="ul">µl</option>
-                    <option value="nl">nl</option>
-                  </select>
-                </div>
-                <p className="text-[11px] text-slate-500 mt-1">
-                  Sets hardware <code className="font-mono text-blue-700 bg-blue-50 px-1 rounded">tvolume</code> and target stroke capacity.
-                </p>
-              </div>
-
-              {/* Target Time (ttime) - only used for infuse/withdraw only */}
+              {/* Exclusive Target Mode Switch (Target Volume vs Target Time) */}
               <div className="pt-2 border-t border-slate-100">
-                <div className="flex items-center justify-between mb-1.5">
-                  <div className="flex items-center gap-1.5">
-                    <input
-                      id="target-time-enabled-checkbox"
-                      type="checkbox"
-                      checked={targetTimeEnabled}
-                      onChange={(e) => setTargetTimeEnabled(e.target.checked)}
-                      className="w-3.5 h-3.5 text-blue-600 rounded cursor-pointer"
-                    />
-                    <label htmlFor="target-time-enabled-checkbox" className="text-xs font-semibold text-slate-700 cursor-pointer select-none">
-                      Enable Target Time (ttime):
-                    </label>
-                  </div>
-                  <span className="text-[10px] text-amber-700 font-semibold bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
-                    Infuse/Withdraw only
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-xs font-bold text-slate-800">
+                    Target Limit Mode:
+                  </label>
+                  <span className="text-[10px] font-semibold text-slate-500 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">
+                    Exclusive Limit
                   </span>
                 </div>
 
-                {targetTimeEnabled && (
-                  <div className="grid grid-cols-3 gap-1.5 mt-2">
-                    <div>
-                      <span className="text-[10px] text-slate-500 block mb-0.5">Hours (0-99)</span>
-                      <input
-                        id="target-time-hours-input"
-                        type="number"
-                        min="0"
-                        max="99"
-                        value={targetTimeHours}
-                        onChange={(e) => setTargetTimeHours(Math.max(0, parseInt(e.target.value, 10) || 0))}
-                        className="w-full px-2 py-1 bg-slate-50 border border-slate-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                      />
+                {/* Segmented Control Switch */}
+                <div className="grid grid-cols-2 p-1 bg-slate-100/90 rounded-lg border border-slate-200 gap-1">
+                  <button
+                    id="target-mode-volume-btn"
+                    type="button"
+                    onClick={() => setTargetMode('volume')}
+                    className={`py-1.5 px-3 text-xs font-semibold rounded-md transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                      targetMode === 'volume'
+                        ? 'bg-white text-blue-700 shadow-xs border border-slate-200 font-bold'
+                        : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
+                    }`}
+                  >
+                    <Database className="w-3.5 h-3.5 text-blue-600" />
+                    Target Volume (Default)
+                  </button>
+                  <button
+                    id="target-mode-time-btn"
+                    type="button"
+                    onClick={() => setTargetMode('time')}
+                    className={`py-1.5 px-3 text-xs font-semibold rounded-md transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                      targetMode === 'time'
+                        ? 'bg-blue-600 text-white shadow-xs font-bold'
+                        : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
+                    }`}
+                  >
+                    <Clock className="w-3.5 h-3.5" />
+                    Target Time
+                  </button>
+                </div>
+
+                {/* 1. Target Volume Mode Panel */}
+                {targetMode === 'volume' ? (
+                  <div className="mt-3 p-3 bg-blue-50/40 rounded-lg border border-blue-100">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label htmlFor="target-volume-input" className="text-xs font-semibold text-slate-800">
+                        Target Stroke Volume:
+                      </label>
+                      <span className="text-[11px] font-mono text-blue-700 font-bold bg-white px-2 py-0.5 rounded border border-blue-200">
+                        Current: {telemetry.targetVolume || telemetry.strokeTarget || 0} {formatDisplayUnit(telemetry.targetUnit || 'ml')}
+                      </span>
                     </div>
-                    <div>
-                      <span className="text-[10px] text-slate-500 block mb-0.5">Mins (0-59)</span>
+                    <div className="grid grid-cols-2 gap-2">
                       <input
-                        id="target-time-mins-input"
+                        id="target-volume-input"
                         type="number"
+                        step="0.01"
                         min="0"
-                        max="59"
-                        value={targetTimeMins}
-                        onChange={(e) => setTargetTimeMins(Math.min(59, Math.max(0, parseInt(e.target.value, 10) || 0)))}
-                        className="w-full px-2 py-1 bg-slate-50 border border-slate-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                        value={targetVolume}
+                        onChange={(e) => setTargetVolume(parseFloat(e.target.value) || 0)}
+                        className="px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-2xs"
                       />
+                      <select
+                        id="target-volume-unit-select"
+                        value={targetVolumeUnit}
+                        onChange={(e) => setTargetVolumeUnit(e.target.value as any)}
+                        className="px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-2xs cursor-pointer"
+                      >
+                        <option value="ml">ml</option>
+                        <option value="ul">µl</option>
+                        <option value="nl">nl</option>
+                      </select>
                     </div>
-                    <div>
-                      <span className="text-[10px] text-slate-500 block mb-0.5">Secs (0-59)</span>
-                      <input
-                        id="target-time-secs-input"
-                        type="number"
-                        min="0"
-                        max="59"
-                        value={targetTimeSecs}
-                        onChange={(e) => setTargetTimeSecs(Math.min(59, Math.max(0, parseInt(e.target.value, 10) || 0)))}
-                        className="w-full px-2 py-1 bg-slate-50 border border-slate-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                      />
+                    <p className="text-[11px] text-slate-600 mt-2">
+                      Hardware command: <code className="font-mono text-blue-700 bg-white px-1 py-0.5 rounded border border-blue-200">tvolume {targetVolume} {targetVolumeUnit}</code>. When reached, pump halts automatically and signals Target Reached.
+                    </p>
+                  </div>
+                ) : (
+                  /* 2. Target Time Mode Panel */
+                  <div className="mt-3 p-3 bg-amber-50/50 rounded-lg border border-amber-200">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-bold text-amber-900 flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5 text-amber-700" />
+                        Run Duration (hh:mm:ss):
+                      </label>
+                      <span className="text-[10px] text-amber-800 font-semibold bg-white px-2 py-0.5 rounded border border-amber-300">
+                        Infuse &amp; Withdraw single runs
+                      </span>
                     </div>
+
+                    <div className="grid grid-cols-3 gap-2 mt-1">
+                      <div>
+                        <span className="text-[10px] text-slate-600 block mb-0.5 font-medium">Hours (0-99)</span>
+                        <input
+                          id="target-time-hours-input"
+                          type="number"
+                          min="0"
+                          max="99"
+                          value={targetTimeHours}
+                          onChange={(e) => setTargetTimeHours(Math.max(0, parseInt(e.target.value, 10) || 0))}
+                          className="w-full px-2 py-1.5 bg-white border border-amber-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-amber-500 focus:outline-none shadow-2xs"
+                        />
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-slate-600 block mb-0.5 font-medium">Mins (0-59)</span>
+                        <input
+                          id="target-time-mins-input"
+                          type="number"
+                          min="0"
+                          max="59"
+                          value={targetTimeMins}
+                          onChange={(e) => setTargetTimeMins(Math.min(59, Math.max(0, parseInt(e.target.value, 10) || 0)))}
+                          className="w-full px-2 py-1.5 bg-white border border-amber-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-amber-500 focus:outline-none shadow-2xs"
+                        />
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-slate-600 block mb-0.5 font-medium">Secs (0-59)</span>
+                        <input
+                          id="target-time-secs-input"
+                          type="number"
+                          min="0"
+                          max="59"
+                          value={targetTimeSecs}
+                          onChange={(e) => setTargetTimeSecs(Math.min(59, Math.max(0, parseInt(e.target.value, 10) || 0)))}
+                          className="w-full px-2 py-1.5 bg-white border border-amber-300 rounded text-xs font-mono text-slate-900 focus:ring-2 focus:ring-amber-500 focus:outline-none shadow-2xs"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Quick Duration Buttons */}
+                    <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                      <span className="text-[10px] text-slate-500 font-medium mr-0.5">Quick:</span>
+                      {[
+                        { label: '15s', h: 0, m: 0, s: 15 },
+                        { label: '30s', h: 0, m: 0, s: 30 },
+                        { label: '1 min', h: 0, m: 1, s: 0 },
+                        { label: '2 min', h: 0, m: 2, s: 0 },
+                        { label: '5 min', h: 0, m: 5, s: 0 },
+                      ].map((preset) => (
+                        <button
+                          key={preset.label}
+                          type="button"
+                          onClick={() => {
+                            setTargetTimeHours(preset.h);
+                            setTargetTimeMins(preset.m);
+                            setTargetTimeSecs(preset.s);
+                          }}
+                          className="px-2 py-0.5 bg-white hover:bg-amber-100 text-amber-900 text-[10px] font-mono font-medium rounded border border-amber-200 transition-colors cursor-pointer"
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Dynamic Delivery Calculator */}
+                    {(() => {
+                      const totalSecs = targetTimeHours * 3600 + targetTimeMins * 60 + targetTimeSecs;
+                      const rateVolUnit = (infuseRateUnit || 'ml/min').split('/')[0] || 'ml';
+                      const isRatePerHour = (infuseRateUnit || '').includes('/hr');
+                      const ratePerSec = (infuseRate / (isRatePerHour ? 3600 : 60));
+                      const estimatedVol = convertVolume(ratePerSec * totalSecs, rateVolUnit, targetVolumeUnit).toFixed(3);
+                      return (
+                        <div className="mt-2.5 p-2 bg-white/90 rounded border border-amber-200/80 text-[11px] text-slate-700">
+                          <div className="flex items-center justify-between">
+                            <span className="text-slate-600">Calculated delivery at {infuseRate} {infuseRateUnit}:</span>
+                            <span className="font-mono font-bold text-amber-900">
+                              ≈ {estimatedVol} {targetVolumeUnit}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-slate-500 mt-1">
+                            Target volume is cleared on the pump (<code className="font-mono text-amber-800 bg-amber-100/70 px-1 rounded">ctvolume</code>) so the run is governed strictly by time. Upon completion, original target volume status is automatically reinstated.
+                          </p>
+                        </div>
+                      );
+                    })()}
                   </div>
                 )}
-                <p className="text-[11px] text-slate-500 mt-1">
-                  Limits single run by duration (<code className="font-mono text-blue-700 bg-blue-50 px-1 rounded">ttime hh:mm:ss</code>). Ignored in continuous mode.
-                </p>
               </div>
 
             </div>
